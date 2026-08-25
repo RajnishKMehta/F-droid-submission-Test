@@ -2,24 +2,26 @@
 """
 find_changed_builds.py
 
-PR me changed ho chuke `metadata/*.yml` files ko dekh kar batata hai ki
-kaunse (appid, versionCode) build targets naye hain ya badal gaye hain —
-yeh F-Droid ke apne `tools/find-changed-builds.py` (fdroiddata repo) jaisa
-hi kaam karta hai, taaki hum bilkul wahi commit/version build karein jo
-F-Droid ka reviewer/CI bhi build karega.
+Looks at the `metadata/*.yml` files changed in the PR and determines
+which (appid, versionCode) build targets are new or have changed.
 
-Ek target "changed" tab count hota hai jab:
-  - metadata file hi is PR me naya add hua ho, YA
-  - us versionCode ka Build entry base branch me nahi tha, YA
-  - us versionCode ke Build entry ke fields (commit, subdir, gradle, ...)
-    base branch se alag hain
+This works similarly to F-Droid's own
+`tools/find-changed-builds.py` in the fdroiddata repository, so we build
+exactly the same commit/version that an F-Droid reviewer/CI would build.
 
-Output: ek JSON array, GitHub Actions matrix (`strategy.matrix.include`)
-me seedha use karne layak:
+A target is considered "changed" when:
+  - The metadata file itself was newly added in this PR, OR
+  - The Build entry for that versionCode did not exist in the base branch, OR
+  - Fields in the Build entry (commit, subdir, gradle, etc.) differ from
+    the base branch.
+
+Output: A JSON array that can be used directly with a GitHub Actions
+matrix (`strategy.matrix.include`):
   [{"appid": "moe.rukamori.archivetune", "versionCode": 140,
     "target": "moe.rukamori.archivetune:140"}, ...]
 
-Env vars chahiye: BASE_SHA, HEAD_SHA (dono commits jinke beech diff lena hai)
+Required environment variables: BASE_SHA, HEAD_SHA
+(both commits between which the diff should be calculated)
 """
 import json
 import os
@@ -33,7 +35,7 @@ HEAD_SHA = os.environ["HEAD_SHA"]
 
 
 def changed_metadata_files() -> list[str]:
-    """metadata/*.yml me se jo files is diff me touch hui hain (deleted chhod kar)."""
+    """Return metadata/*.yml files that were modified in this diff, excluding deleted files."""
     result = subprocess.run(
         [
             "git", "diff", "--name-only", "--diff-filter=d",
@@ -45,7 +47,7 @@ def changed_metadata_files() -> list[str]:
 
 
 def load_yaml_at_ref(ref: str, path: str):
-    """Kisi bhi commit par file ka content nikalo; file wahan na ho to None."""
+    """Retrieve a file's content from any Git commit; return None if the file does not exist there."""
     result = subprocess.run(
         ["git", "show", f"{ref}:{path}"],
         capture_output=True, text=True,
@@ -55,7 +57,7 @@ def load_yaml_at_ref(ref: str, path: str):
     try:
         return yaml.safe_load(result.stdout) or {}
     except yaml.YAMLError as exc:
-        print(f"::warning::{path} @ {ref} parse nahi hui: {exc}", file=sys.stderr)
+        print(f"::warning::{path} @ {ref} could not be parsed: {exc}", file=sys.stderr)
         return None
 
 
@@ -75,7 +77,8 @@ def main() -> None:
 
         head_meta = load_yaml_at_ref(HEAD_SHA, path)
         if head_meta is None:
-            # file PR me delete ho gayi ya parse nahi hui — kuch build nahi karna
+            # The file was deleted in the PR or could not be parsed.
+            # There is nothing to build.
             continue
 
         base_meta = load_yaml_at_ref(BASE_SHA, path)
