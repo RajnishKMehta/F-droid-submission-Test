@@ -1,0 +1,152 @@
+name: F-Droid Metadata Build Check
+
+# Jab bhi koi PR /metadata/*.yml ko chhuye (jaise metadata/moe.rukamori.archivetune.yml),
+# yeh workflow us PR me naye/badle hue Build entries ko F-Droid ke apne
+# buildserver-trixie image se, F-Droid jaisa hi (fdroid fetchsrclibs + fdroid
+# build --on-server --test) build karta hai — same commit, same tooling.
+#
+# workflow_dispatch se manually bhi ek specific appid:versionCode build kar
+# sakte ho (input "target" me), PR ke bina bhi.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'metadata/*.yml'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Manually build ek specific appid:versionCode (khaali chhodo to PR-diff se auto-detect hoga)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1) PR me kaunse (appid, versionCode) naye/badle hain, wo dhundo
+  # ---------------------------------------------------------------------
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.find.outputs.targets }}
+      has_targets: ${{ steps.find.outputs.has_targets }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # NOTE: fetch-depth 0 poori history laata hai taaki base/head diff
+          # kar sakein. Agar repo bahut bada hai (jaise asli fdroiddata),
+          # to isse thoda slow ho sakta hai — chaho to kam karke koi
+          # reasonable number daal sakte ho.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - run: pip install --quiet pyyaml
+
+      - id: find
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MANUAL_TARGET: ${{ github.event.inputs.target }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${MANUAL_TARGET:-}" ]; then
+            APPID="${MANUAL_TARGET%%:*}"
+            VC="${MANUAL_TARGET##*:}"
+            TARGETS_JSON="[{\"appid\":\"$APPID\",\"versionCode\":$VC,\"target\":\"$MANUAL_TARGET\"}]"
+          else
+            git fetch origin "$BASE_SHA" "$HEAD_SHA" --depth=1 || true
+            TARGETS_JSON="$(python3 .github/scripts/find_changed_builds.py)"
+          fi
+
+          echo "Detected targets: $TARGETS_JSON"
+          echo "targets=$TARGETS_JSON" >> "$GITHUB_OUTPUT"
+
+          if [ "$TARGETS_JSON" = "[]" ]; then
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------
+  # 2) Har naye/badle target ko F-Droid ke buildserver-trixie se build karo
+  # ---------------------------------------------------------------------
+  build:
+    needs: detect
+    if: needs.detect.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - name: fdroidserver clone karo (master se, F-Droid ka apna CI bhi yahi karta hai)
+        run: git clone --depth=1 https://gitlab.com/fdroid/fdroidserver.git "${{ runner.temp }}/fdroidserver"
+
+      - name: Container ke andar (vagrant user) read/write allow karo
+        run: |
+          chmod -R o+rwX "${{ github.workspace }}"
+          chmod -R o+rwX "${{ runner.temp }}/fdroidserver"
+
+      - name: F-Droid buildserver-trixie image pull karo
+        run: docker pull registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie
+
+      - name: "Build: ${{ matrix.target }}"
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          docker run --rm \
+            -u vagrant \
+            -e BUILD_TARGET \
+            -v "${{ github.workspace }}:/build" \
+            -v "${{ runner.temp }}/fdroidserver:/home/vagrant/fdroidserver" \
+            -w /build \
+            --entrypoint /bin/bash \
+            registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie \
+            /build/.github/scripts/run_fdroid_build.sh
+
+      # Teeno artifacts `if: always()` ke saath — build fail ho jaye tab
+      # bhi logs/partial-build upload ho, taaki failure debug ho sake
+      # (jaise humne pehle reproducibility failure debug kiya tha).
+
+      - name: "Upload: pura build (60 din expiry)"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdroid-full-build-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: |
+            build/
+            unsigned/
+            logs/
+            tmp/
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: "Upload: APK (alag)"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdroid-apk-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: unsigned/*.apk
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: "Upload: build logs (alag)"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdroid-logs-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: logs/
+          retention-days: 60
+          if-no-files-found: warn
