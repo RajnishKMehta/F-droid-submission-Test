@@ -141,7 +141,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: fdroid-apk-${{ matrix.appid }}-${{ matrix.versionCode }}
-          path: unsigned/*.apk
+          path: |
+            unsigned/*.apk
+            tmp/*.apk
           retention-days: 60
           if-no-files-found: warn
 
