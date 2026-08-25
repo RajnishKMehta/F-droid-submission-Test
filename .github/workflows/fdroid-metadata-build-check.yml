@@ -1,12 +1,15 @@
 name: F-Droid Metadata Build Check
 
-# Jab bhi koi PR /metadata/*.yml ko chhuye (jaise metadata/moe.rukamori.archivetune.yml),
-# yeh workflow us PR me naye/badle hue Build entries ko F-Droid ke apne
-# buildserver-trixie image se, F-Droid jaisa hi (fdroid fetchsrclibs + fdroid
-# build --on-server --test) build karta hai — same commit, same tooling.
+# Whenever a PR modifies /metadata/*.yml (for example,
+# metadata/moe.rukamori.archivetune.yml), this workflow builds the new/changed
+# Build entries in that PR using F-Droid's own buildserver-trixie image,
+# following the same process as F-Droid:
+# fdroid fetchsrclibs + fdroid build --on-server --test
+# This ensures the same commit and the same build tooling are used.
 #
-# workflow_dispatch se manually bhi ek specific appid:versionCode build kar
-# sakte ho (input "target" me), PR ke bina bhi.
+# The workflow can also be triggered manually with workflow_dispatch to build
+# a specific appid:versionCode (provided through the "target" input),
+# even without a PR.
 
 on:
   pull_request:
@@ -16,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Manually build ek specific appid:versionCode (khaali chhodo to PR-diff se auto-detect hoga)'
+        description: 'Manually build a specific appid:versionCode (leave empty to auto-detect from the PR diff)'
         required: false
         default: ''
 
@@ -25,7 +28,7 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------
-  # 1) PR me kaunse (appid, versionCode) naye/badle hain, wo dhundo
+  # 1) Detect new/changed (appid, versionCode) targets in the PR
   # ---------------------------------------------------------------------
   detect:
     runs-on: ubuntu-latest
@@ -35,10 +38,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # NOTE: fetch-depth 0 poori history laata hai taaki base/head diff
-          # kar sakein. Agar repo bahut bada hai (jaise asli fdroiddata),
-          # to isse thoda slow ho sakta hai — chaho to kam karke koi
-          # reasonable number daal sakte ho.
+          # NOTE: fetch-depth 0 fetches the complete Git history so we can
+          # compare the base and head commits. For very large repositories
+          # (such as the actual fdroiddata repository), this may be slower.
+          # If needed, you can reduce this to a reasonable depth.
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
 
@@ -75,7 +78,7 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------
-  # 2) Har naye/badle target ko F-Droid ke buildserver-trixie se build karo
+  # 2) Build each new/changed target using F-Droid's buildserver-trixie image
   # ---------------------------------------------------------------------
   build:
     needs: detect
@@ -91,15 +94,15 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
 
-      - name: fdroidserver clone karo (master se, F-Droid ka apna CI bhi yahi karta hai)
+      - name: Clone fdroidserver from master (F-Droid's own CI does the same)
         run: git clone --depth=1 https://gitlab.com/fdroid/fdroidserver.git "${{ runner.temp }}/fdroidserver"
 
-      - name: Container ke andar (vagrant user) read/write allow karo
+      - name: Allow read/write access for the container (vagrant user)
         run: |
           chmod -R o+rwX "${{ github.workspace }}"
           chmod -R o+rwX "${{ runner.temp }}/fdroidserver"
 
-      - name: F-Droid buildserver-trixie image pull karo
+      - name: Pull F-Droid's buildserver-trixie image
         run: docker pull registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie
 
       - name: "Build: ${{ matrix.target }}"
@@ -116,11 +119,11 @@ jobs:
             registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie \
             /build/.github/scripts/run_fdroid_build.sh
 
-      # Teeno artifacts `if: always()` ke saath — build fail ho jaye tab
-      # bhi logs/partial-build upload ho, taaki failure debug ho sake
-      # (jaise humne pehle reproducibility failure debug kiya tha).
+      # Upload all three artifact sets with if: always(), so build logs and
+      # partial build output are preserved even when the build fails.
+      # This makes failures easier to debug, such as reproducibility failures.
 
-      - name: "Upload: pura build (60 din expiry)"
+      - name: "Upload: complete build (60-day retention)"
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -133,7 +136,7 @@ jobs:
           retention-days: 60
           if-no-files-found: warn
 
-      - name: "Upload: APK (alag)"
+      - name: "Upload: APK (separate)"
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -142,7 +145,7 @@ jobs:
           retention-days: 60
           if-no-files-found: warn
 
-      - name: "Upload: build logs (alag)"
+      - name: "Upload: build logs (separate)"
         if: always()
         uses: actions/upload-artifact@v7
         with:
