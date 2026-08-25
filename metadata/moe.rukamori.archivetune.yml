@@ -1,0 +1,46 @@
+AntiFeatures:
+  NonFreeNet:
+    en-US: Uses YouTube Music and other proprietary online services for music playback,
+      social features, and related functionality.
+Categories:
+  - Local Media Player
+  - Multimedia
+  - Online Media Player
+License: GPL-3.0-only
+AuthorName: rukamori
+AuthorEmail: me@koiiverse.cloud
+AuthorWebSite: https://koiiverse.cloud
+WebSite: https://archivetune.koiiverse.cloud
+SourceCode: https://github.com/rukamori/ArchiveTune
+IssueTracker: https://github.com/rukamori/ArchiveTune/issues
+Translation: https://translate.codeberg.org/projects/archivetune
+Changelog: https://github.com/rukamori/ArchiveTune/releases
+Donate: https://koiiverse.cloud/donate
+
+AutoName: ArchiveTune
+
+RepoType: git
+Repo: https://github.com/rukamori/ArchiveTune.git
+Binaries: 
+  https://github.com/rukamori/ArchiveTune/releases/download/v%v/app-foss-mobile-universal-release.apk
+
+Builds:
+  - versionName: 14.1.0
+    versionCode: 140
+    commit: 7f6917635997b89bc6b8421e4b04134b89b9b881
+    subdir: app
+    submodules: true
+    gradle:
+      - fossMobileUniversal
+
+AllowedAPKSigningKeys: bb2e5b7e476c0de63b06686209c0f60e904f9988e9bb452da280596e8ae98e33
+
+MaintainerNotes: |-
+  F-Droid package maintenance is handled by @RajnishKMehta.
+  For F-Droid packaging, build, or metadata issues, please tag
+  @RajnishKMehta in the upstream repository.
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags
+CurrentVersion: 14.1.0
+CurrentVersionCode: 140
