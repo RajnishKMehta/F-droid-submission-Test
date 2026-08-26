@@ -37,5 +37,5 @@ AllowedAPKSigningKeys: 2b0ca7f890305622f7a9ed57f07b11764d1ad2ba534599d802bb91008
 
 AutoUpdateMode: Version
 UpdateCheckMode: Tags
-CurrentVersion: 14.1.0
-CurrentVersionCode: 140
+CurrentVersion: 14.1.1
+CurrentVersionCode: 141
