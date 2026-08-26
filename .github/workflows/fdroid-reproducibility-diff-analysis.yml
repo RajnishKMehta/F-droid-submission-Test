@@ -1,21 +1,23 @@
 name: F-Droid Reproducibility Diff Analysis
 
-# Yeh workflow purane "F-Droid Metadata Build Check" (fdroid-metadata-build-check.yml)
-# se BILKUL ALAG/independent hai -- na koi file share karta hai na koi
-# dependency. Dono ek saath, alag-alag, chal sakte hain.
+# Yeh workflow purane "F-Droid Metadata Build Check" se
+# completely independent hai.
 #
-# Extra kaam jo yeh workflow karta hai: agar built APK, upstream reference
-# APK se match nahi karti (--test verification fail), to yeh poora
-# human-readable diff-analysis banata hai -- kaunsi files alag hain,
-# kaise alag hain (dex ka smali-diff, resources ka XML-diff, opaque
-# binaries ka hex-diff), aur ek summary report -- sab kuchh alag artifacts
-# me upload karta hai.
+# Main behavior:
+#   1. F-Droid build/test run karo
+#   2. Agar --test verification fail ho, workflow ko turant mat roko
+#   3. Built APK aur reference APK locate karo
+#   4. Dono available hon to full APK diff analysis karo
+#   5. Saare build/log/APK/diff artifacts upload karo
+#   6. Sab artifacts upload hone ke BAAD original build result ko
+#      workflow status me reflect karo
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
       - 'metadata/*.yml'
+
   workflow_dispatch:
     inputs:
       target:
@@ -27,27 +29,35 @@ permissions:
   contents: read
 
 jobs:
-  # ---------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
   # 1) PR me kaunse (appid, versionCode) naye/badle hain, wo dhundo
-  # ---------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
   detect:
     runs-on: ubuntu-latest
+
     outputs:
       targets: ${{ steps.find.outputs.targets }}
       has_targets: ${{ steps.find.outputs.has_targets }}
+
     steps:
-      - uses: actions/checkout@v4
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
-      - run: pip install --quiet pyyaml
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
 
-      - id: find
+      - name: Detect reproducibility targets
+        id: find
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -58,13 +68,17 @@ jobs:
           if [ -n "${MANUAL_TARGET:-}" ]; then
             APPID="${MANUAL_TARGET%%:*}"
             VC="${MANUAL_TARGET##*:}"
+
             TARGETS_JSON="[{\"appid\":\"$APPID\",\"versionCode\":$VC,\"target\":\"$MANUAL_TARGET\"}]"
           else
             git fetch origin "$BASE_SHA" "$HEAD_SHA" --depth=1 || true
+
             TARGETS_JSON="$(python3 .github/scripts/find_reproducibility_diff_targets.py)"
           fi
 
-          echo "Detected targets: $TARGETS_JSON"
+          echo "Detected targets:"
+          echo "$TARGETS_JSON"
+
           echo "targets=$TARGETS_JSON" >> "$GITHUB_OUTPUT"
 
           if [ "$TARGETS_JSON" = "[]" ]; then
@@ -73,38 +87,87 @@ jobs:
             echo "has_targets=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # ---------------------------------------------------------------------
-  # 2) Build karo, phir reference se compare karke full diff-analysis banao
-  # ---------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # 2) Build + locate + diff analysis
+  # ---------------------------------------------------------------------------
   build-and-analyze:
     needs: detect
+
     if: needs.detect.outputs.has_targets == 'true'
+
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.detect.outputs.targets) }}
+
     steps:
-      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Checkout
+      # -----------------------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
 
-      - name: fdroidserver clone karo
-        run: git clone --depth=1 https://gitlab.com/fdroid/fdroidserver.git "${{ runner.temp }}/fdroidserver"
 
-      - name: Container ke liye read/write allow karo
+      # -----------------------------------------------------------------------
+      # Prepare F-Droid buildserver
+      # -----------------------------------------------------------------------
+
+      - name: Clone fdroidserver
+        run: |
+          git clone \
+            --depth=1 \
+            https://gitlab.com/fdroid/fdroidserver.git \
+            "${{ runner.temp }}/fdroidserver"
+
+
+      - name: Allow container read/write access
         run: |
           chmod -R o+rwX "${{ github.workspace }}"
           chmod -R o+rwX "${{ runner.temp }}/fdroidserver"
 
-      - name: F-Droid buildserver-trixie image pull karo
-        run: docker pull registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie
+
+      - name: Pull F-Droid buildserver image
+        run: |
+          docker pull \
+            registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie
+
+
+      # -----------------------------------------------------------------------
+      # BUILD
+      #
+      # IMPORTANT:
+      # continue-on-error=true yaha intentional hai.
+      #
+      # F-Droid --test me APK reproducibility mismatch hone par command
+      # non-zero exit kar sakta hai.
+      #
+      # Hume us non-zero ko capture karke aage APK locate + diff analysis
+      # chalani hai.
+      # -----------------------------------------------------------------------
 
       - name: "Build: ${{ matrix.target }}"
+        id: fdroid-build
+        continue-on-error: true
+
         env:
           BUILD_TARGET: ${{ matrix.target }}
+
         run: |
+          set +e
+
+          echo "=============================================="
+          echo " F-DROID REPRODUCIBILITY BUILD"
+          echo " Target: ${BUILD_TARGET}"
+          echo "=============================================="
+
           docker run --rm \
             -u vagrant \
             -e BUILD_TARGET \
@@ -115,73 +178,270 @@ jobs:
             registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie \
             /build/.github/scripts/run_fdroid_build_for_diff.sh
 
-      # fdroidserver failed build ko tmp/ me rakhta hai, successful ko
-      # unsigned/ me. Reference (upstream Binaries: se downloaded) apk
-      # hamesha tmp/binaries/ me hoti hai (--test flag ke through).
-      - name: Built APK aur reference APK dhundo
+          BUILD_EXIT=$?
+
+          echo ""
+          echo "=============================================="
+          echo " F-DROID EXIT CODE: ${BUILD_EXIT}"
+          echo "=============================================="
+
+          echo "build_exit=${BUILD_EXIT}" >> "$GITHUB_OUTPUT"
+
+          if [ "$BUILD_EXIT" -eq 0 ]; then
+            echo "F-Droid build/test completed successfully."
+          else
+            echo "::warning::F-Droid returned exit code ${BUILD_EXIT}."
+            echo "::warning::Continuing because APK diff analysis must run."
+          fi
+
+          # Intentionally exit 0.
+          #
+          # continue-on-error bhi laga hua hai, lekin explicit 0 rakhne se
+          # step ka behavior clear hai: analysis ko continue karna hai.
+          exit 0
+
+
+      # -----------------------------------------------------------------------
+      # Locate APKs
+      #
+      # Failed reproducibility test ke case me built APK aksar tmp/ me hoti hai.
+      # Successful build ke case me unsigned/ me ho sakti hai.
+      #
+      # Reference APK:
+      #   tmp/binaries/<appid>_<versionCode>.binary.apk
+      # -----------------------------------------------------------------------
+
+      - name: Locate built APK and reference APK
         id: locate
+        if: always()
+
+        env:
+          APPID: ${{ matrix.appid }}
+          VERSION_CODE: ${{ matrix.versionCode }}
+
         run: |
           set -euo pipefail
-          APPID="${{ matrix.appid }}"
-          VC="${{ matrix.versionCode }}"
 
           BUILT=""
-          if [ -f "tmp/${APPID}_${VC}.apk" ]; then
-            BUILT="tmp/${APPID}_${VC}.apk"
-          elif [ -f "unsigned/${APPID}_${VC}.apk" ]; then
-            BUILT="unsigned/${APPID}_${VC}.apk"
+          REFERENCE=""
+
+          echo "Looking for built APK..."
+
+          # Failed F-Droid verification/build output
+          if [ -f "tmp/${APPID}_${VERSION_CODE}.apk" ]; then
+            BUILT="tmp/${APPID}_${VERSION_CODE}.apk"
+
+          # Successful unsigned build output
+          elif [ -f "unsigned/${APPID}_${VERSION_CODE}.apk" ]; then
+            BUILT="unsigned/${APPID}_${VERSION_CODE}.apk"
           fi
 
-          REFERENCE=""
-          if [ -f "tmp/binaries/${APPID}_${VC}.binary.apk" ]; then
-            REFERENCE="tmp/binaries/${APPID}_${VC}.binary.apk"
+
+          echo "Looking for reference APK..."
+
+          if [ -f "tmp/binaries/${APPID}_${VERSION_CODE}.binary.apk" ]; then
+            REFERENCE="tmp/binaries/${APPID}_${VERSION_CODE}.binary.apk"
           fi
+
+
+          echo "=============================================="
+          echo " APK LOCATION RESULT"
+          echo "=============================================="
+
+          echo "Built APK     : ${BUILT:-NOT FOUND}"
+          echo "Reference APK : ${REFERENCE:-NOT FOUND}"
 
           echo "built_apk=$BUILT" >> "$GITHUB_OUTPUT"
           echo "reference_apk=$REFERENCE" >> "$GITHUB_OUTPUT"
 
+
           if [ -z "$BUILT" ]; then
-            echo "::warning::Built APK nahi mili ($APPID:$VC) -- diff analysis skip hoga"
-          fi
-          if [ -z "$REFERENCE" ]; then
-            echo "::warning::Reference (upstream) APK nahi mili -- is app me Binaries: nahi hai ya --test verification tak nahi pahuncha. Diff analysis skip hoga."
+            echo "::warning::Built APK nahi mili (${APPID}:${VERSION_CODE})."
           fi
 
-      - name: apktool install karo (human-readable decompile ke liye)
-        if: steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+          if [ -z "$REFERENCE" ]; then
+            echo "::warning::Reference APK nahi mili (${APPID}:${VERSION_CODE})."
+          fi
+
+
+      # -----------------------------------------------------------------------
+      # Show APK information
+      # -----------------------------------------------------------------------
+
+      - name: Show APK information
+        if: always() && steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+        run: |
+          echo "Built APK:"
+          ls -lh "${{ steps.locate.outputs.built_apk }}"
+
+          echo ""
+          echo "Reference APK:"
+          ls -lh "${{ steps.locate.outputs.reference_apk }}"
+
+          echo ""
+          echo "SHA256:"
+          sha256sum \
+            "${{ steps.locate.outputs.built_apk }}" \
+            "${{ steps.locate.outputs.reference_apk }}"
+
+
+      # -----------------------------------------------------------------------
+      # Install apktool
+      # -----------------------------------------------------------------------
+
+      - name: Install apktool
+        if: always() && steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
         run: |
           set -e
-          if ! command -v java &>/dev/null; then
+
+          if ! command -v java >/dev/null 2>&1; then
             sudo apt-get update -qq
             sudo apt-get install -y default-jre-headless
           fi
-          if ! (sudo apt-get update -qq && sudo apt-get install -y apktool); then
-            echo "apt se apktool nahi mila -- GitHub releases se manual install kar rahe hain"
+
+          if ! (
+            sudo apt-get update -qq &&
+            sudo apt-get install -y apktool
+          ); then
+
+            echo "apt se apktool nahi mila."
+            echo "GitHub release se apktool install kar rahe hain."
+
             APKTOOL_VERSION="2.9.3"
-            sudo curl -sL "https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool" -o /usr/local/bin/apktool
-            sudo curl -sL "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -o /usr/local/bin/apktool.jar
+
+            sudo curl -sL \
+              "https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool" \
+              -o /usr/local/bin/apktool
+
+            sudo curl -sL \
+              "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" \
+              -o /usr/local/bin/apktool.jar
+
             sudo chmod +x /usr/local/bin/apktool
           fi
+
           apktool --version
 
-      - uses: actions/setup-python@v5
-        if: steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+
+      # -----------------------------------------------------------------------
+      # Setup Python for analysis
+      # -----------------------------------------------------------------------
+
+      - name: Setup Python for diff analysis
+        if: always() && steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
-      - name: Diff analysis chalao (human-readable + summary bante hain)
-        if: steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+
+      # -----------------------------------------------------------------------
+      # FULL APK DIFFERENCE ANALYSIS
+      #
+      # Yahi main part hai.
+      #
+      # APK different hua to yeh step chalega.
+      # Build/test step ke non-zero exit ki wajah se yeh ab skip nahi hoga.
+      # -----------------------------------------------------------------------
+
+      - name: Run APK difference analysis
+        id: analysis
+        if: always() && steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+        continue-on-error: true
+
         run: |
+          set +e
+
+          mkdir -p analysis-output
+
+          echo "=============================================="
+          echo " APK DIFFERENCE ANALYSIS"
+          echo "=============================================="
+
           python3 .github/scripts/analyze_apk_differences.py \
             "${{ steps.locate.outputs.built_apk }}" \
             "${{ steps.locate.outputs.reference_apk }}" \
             "analysis-output"
 
-      # ---- Standard build artifacts (purane workflow jaisa hi) ----
+          ANALYSIS_EXIT=$?
 
-      - name: "Upload: pura build (60 din)"
+          echo ""
+          echo "Diff analysis exit code: ${ANALYSIS_EXIT}"
+
+          echo "analysis_exit=${ANALYSIS_EXIT}" >> "$GITHUB_OUTPUT"
+
+          if [ "$ANALYSIS_EXIT" -ne 0 ]; then
+            echo "::warning::APK diff analysis returned exit code ${ANALYSIS_EXIT}."
+          fi
+
+          exit 0
+
+
+      # -----------------------------------------------------------------------
+      # Create machine-readable run summary
+      # -----------------------------------------------------------------------
+
+      - name: Create workflow summary
         if: always()
-        uses: actions/upload-artifact@v4
+
+        env:
+          BUILD_EXIT: ${{ steps.fdroid-build.outputs.build_exit }}
+          BUILT_APK: ${{ steps.locate.outputs.built_apk }}
+          REFERENCE_APK: ${{ steps.locate.outputs.reference_apk }}
+          ANALYSIS_EXIT: ${{ steps.analysis.outputs.analysis_exit }}
+
+        run: |
+          {
+            echo "## F-Droid Reproducibility Diff Analysis"
+            echo ""
+            echo "| Field | Result |"
+            echo "|---|---|"
+            echo "| Target | \`${{ matrix.target }}\` |"
+            echo "| App ID | \`${{ matrix.appid }}\` |"
+            echo "| Version Code | \`${{ matrix.versionCode }}\` |"
+            echo "| F-Droid exit code | \`${BUILD_EXIT:-unknown}\` |"
+            echo "| Built APK | \`${BUILT_APK:-NOT FOUND}\` |"
+            echo "| Reference APK | \`${REFERENCE_APK:-NOT FOUND}\` |"
+            echo "| Diff analysis exit code | \`${ANALYSIS_EXIT:-not run}\` |"
+            echo ""
+
+            if [ -n "${BUILT_APK:-}" ] && [ -n "${REFERENCE_APK:-}" ]; then
+              echo "### Analysis status"
+              echo ""
+              echo "Both APKs were found. Difference analysis was executed."
+              echo ""
+            elif [ -n "${BUILT_APK:-}" ]; then
+              echo "### Analysis status"
+              echo ""
+              echo "Built APK was found, but reference APK was not found."
+              echo ""
+            else
+              echo "### Analysis status"
+              echo ""
+              echo "Built APK was not found. Diff analysis could not run."
+              echo ""
+            fi
+
+            if [ "${BUILD_EXIT:-1}" = "0" ]; then
+              echo "### F-Droid build result"
+              echo ""
+              echo "Build/test completed successfully."
+            else
+              echo "### F-Droid build result"
+              echo ""
+              echo "F-Droid returned a non-zero exit code."
+              echo ""
+              echo "The workflow intentionally continued so the produced APK could be analysed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      # -----------------------------------------------------------------------
+      # Standard build artifacts
+      # -----------------------------------------------------------------------
+
+      - name: "Upload: full build"
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: fdroid-diff-full-build-${{ matrix.appid }}-${{ matrix.versionCode }}
           path: |
@@ -192,31 +452,46 @@ jobs:
           retention-days: 60
           if-no-files-found: warn
 
-      - name: "Upload: APK (alag)"
+
+      # -----------------------------------------------------------------------
+      # APK artifacts
+      # -----------------------------------------------------------------------
+
+      - name: "Upload: APKs"
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fdroid-diff-apk-${{ matrix.appid }}-${{ matrix.versionCode }}
           path: |
             unsigned/*.apk
             tmp/*.apk
+            tmp/binaries/*.apk
           retention-days: 60
           if-no-files-found: warn
 
-      - name: "Upload: build logs (alag)"
+
+      # -----------------------------------------------------------------------
+      # Logs
+      # -----------------------------------------------------------------------
+
+      - name: "Upload: build logs"
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fdroid-diff-logs-${{ matrix.appid }}-${{ matrix.versionCode }}
-          path: logs/
+          path: |
+            logs/
           retention-days: 60
           if-no-files-found: warn
 
-      # ---- Naye diff-analysis artifacts ----
 
-      - name: "Upload: Difference analysis (summary + har file ka ALAG human-readable diff)"
+      # -----------------------------------------------------------------------
+      # Human-readable diff analysis
+      # -----------------------------------------------------------------------
+
+      - name: "Upload: difference analysis"
         if: always() && steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fdroid-diff-analysis-${{ matrix.appid }}-${{ matrix.versionCode }}
           path: |
@@ -228,9 +503,14 @@ jobs:
           retention-days: 60
           if-no-files-found: warn
 
-      - name: "Upload: Poore decompiled trees (maximum raw data)"
+
+      # -----------------------------------------------------------------------
+      # Decompiled trees / raw data
+      # -----------------------------------------------------------------------
+
+      - name: "Upload: decompiled trees"
         if: always() && steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fdroid-diff-decompiled-${{ matrix.appid }}-${{ matrix.versionCode }}
           path: |
@@ -240,3 +520,45 @@ jobs:
             analysis-output/raw_reference/
           retention-days: 60
           if-no-files-found: warn
+
+
+      # -----------------------------------------------------------------------
+      # FINAL STATUS
+      #
+      # Sabse important:
+      #
+      # Pehle build fail hua
+      #       ↓
+      # analysis chala
+      #       ↓
+      # artifacts upload hue
+      #       ↓
+      # ab original build status reflect karo
+      #
+      # Isse artifacts lose nahi honge.
+      # -----------------------------------------------------------------------
+
+      - name: Finalize F-Droid build status
+        if: always()
+
+        env:
+          BUILD_EXIT: ${{ steps.fdroid-build.outputs.build_exit }}
+
+        run: |
+          echo "=============================================="
+          echo " FINAL RESULT"
+          echo "=============================================="
+
+          echo "F-Droid build exit code: ${BUILD_EXIT:-unknown}"
+
+          if [ "${BUILD_EXIT:-1}" != "0" ]; then
+            echo ""
+            echo "F-Droid build/test returned non-zero."
+            echo "Diff analysis and artifact upload were intentionally completed first."
+            echo ""
+
+            # Job ko failed mark karo AFTER all analysis/artifacts.
+            exit 1
+          fi
+
+          echo "F-Droid build/test successful."
