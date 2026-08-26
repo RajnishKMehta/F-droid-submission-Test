@@ -11,18 +11,18 @@ AuthorName: rukamori
 AuthorEmail: me@koiiverse.cloud
 AuthorWebSite: https://koiiverse.cloud
 WebSite: https://archivetune.koiiverse.cloud
-SourceCode: https://github.com/rukamori/ArchiveTune
-IssueTracker: https://github.com/rukamori/ArchiveTune/issues
+SourceCode: https://github.com/RajnishKMehta/ArchiveTune-build-test
+IssueTracker: https://github.com/RajnishKMehta/ArchiveTune-build-test/issues
 Translation: https://translate.codeberg.org/projects/archivetune
-Changelog: https://github.com/rukamori/ArchiveTune/releases
+Changelog: https://github.com/RajnishKMehta/ArchiveTune-build-test/releases
 Donate: https://koiiverse.cloud/donate
 
 AutoName: ArchiveTune
 
 RepoType: git
-Repo: https://github.com/rukamori/ArchiveTune.git
+Repo: https://github.com/RajnishKMehta/ArchiveTune-build-test.git
 Binaries: 
-  https://github.com/rukamori/ArchiveTune/releases/download/v%v/app-foss-mobile-universal-release.apk
+  https://github.com/RajnishKMehta/ArchiveTune-build-test/releases/download/v%v/app-foss-mobile-universal-release.apk
 
 Builds:
   - versionName: 14.1.0
@@ -33,12 +33,7 @@ Builds:
     gradle:
       - fossMobileUniversal
 
-AllowedAPKSigningKeys: bb2e5b7e476c0de63b06686209c0f60e904f9988e9bb452da280596e8ae98e33
-
-MaintainerNotes: |-
-  F-Droid package maintenance is handled by @RajnishKMehta.
-  For F-Droid packaging, build, or metadata issues, please tag
-  @RajnishKMehta in the upstream repository.
+AllowedAPKSigningKeys: 2b0ca7f890305622f7a9ed57f07b11764d1ad2ba534599d802bb91008269b778
 
 AutoUpdateMode: Version
 UpdateCheckMode: Tags
