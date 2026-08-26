@@ -1,0 +1,218 @@
+name: F-Droid Reproducibility & Diff Analysis
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'metadata/*.yml'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target to build and analyze (e.g. moe.rukamori.archivetune:140)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1) Detect Targets
+  # ---------------------------------------------------------------------
+  detect_targets:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.detect.outputs.targets }}
+      has_targets: ${{ steps.detect.outputs.has_targets }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - run: pip install --quiet pyyaml
+
+      - id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MANUAL_TARGET: ${{ github.event.inputs.target }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${MANUAL_TARGET:-}" ]; then
+            APPID="${MANUAL_TARGET%%:*}"
+            VC="${MANUAL_TARGET##*:}"
+            TARGETS_JSON="[{\"appid\":\"$APPID\",\"versionCode\":$VC,\"target\":\"$MANUAL_TARGET\",\"binaries_url\":\"\"}]"
+          else
+            git fetch origin "$BASE_SHA" "$HEAD_SHA" --depth=1 || true
+            TARGETS_JSON="$(python3 .github/scripts/find_changed_diff_builds.py)"
+          fi
+
+          echo "Targets detected: $TARGETS_JSON"
+          echo "targets=$TARGETS_JSON" >> "$GITHUB_OUTPUT"
+
+          if [ "$TARGETS_JSON" = "[]" ]; then
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------
+  # 2) Build, Decompile, and Perform Deep Diff Analysis
+  # ---------------------------------------------------------------------
+  build_and_analyze_diff:
+    needs: detect_targets
+    if: needs.detect_targets.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect_targets.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - name: Set up Python & Diff Analysis Tooling
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Install Host Analysis Tools (diffoscope, aapt2, apktool)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y aapt dexdump diffoscope binutils || true
+
+      - name: Clone fdroidserver from master
+        run: git clone --depth=1 https://gitlab.com/fdroid/fdroidserver.git "${{ runner.temp }}/fdroidserver"
+
+      - name: Set file permissions
+        run: |
+          chmod -R o+rwX "${{ github.workspace }}"
+          chmod -R o+rwX "${{ runner.temp }}/fdroidserver"
+
+      - name: Pull F-Droid buildserver container
+        run: docker pull registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie
+
+      - name: Run F-Droid Build Inside Container
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          docker run --rm \
+            -u vagrant \
+            -e BUILD_TARGET \
+            -v "${{ github.workspace }}:/build" \
+            -v "${{ runner.temp }}/fdroidserver:/home/vagrant/fdroidserver" \
+            -w /build \
+            --entrypoint /bin/bash \
+            registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie \
+            /build/.github/scripts/run_fdroid_diff_build.sh
+
+      - name: Fetch Reference APK (if not automatically fetched by fdroid test)
+        id: fetch_reference
+        run: |
+          mkdir -p reference_apks rebuilt_apks
+          
+          # Find rebuilt APK
+          REBUILT_APK=$(find unsigned/ -name "*.apk" | head -n 1)
+          if [ -n "$REBUILT_APK" ]; then
+            cp "$REBUILT_APK" rebuilt_apks/rebuilt.apk
+            echo "rebuilt_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rebuilt_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Find reference APK downloaded by fdroid build --test in tmp/ or unsigned/
+          REF_APK=$(find tmp/ unsigned/ -name "*reference*.apk" -o -name "*upstream*.apk" -o -name "*origin*.apk" | head -n 1)
+          
+          # If not found locally, download using binaries_url if available
+          if [ -z "$REF_APK" ] && [ -n "${{ matrix.binaries_url }}" ]; then
+            echo "Downloading reference APK from: ${{ matrix.binaries_url }}"
+            curl -L -o reference_apks/reference.apk "${{ matrix.binaries_url }}" || true
+            if [ -f reference_apks/reference.apk ]; then
+              REF_APK="reference_apks/reference.apk"
+            fi
+          fi
+
+          if [ -n "$REF_APK" ] && [ -f "$REF_APK" ]; then
+            cp "$REF_APK" reference_apks/reference.apk
+            echo "reference_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reference_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Execute Deep Diff & Human-Readable Decompilation Analysis
+        if: steps.fetch_reference.outputs.rebuilt_found == 'true' && steps.fetch_reference.outputs.reference_found == 'true'
+        run: |
+          python3 .github/scripts/analyze_apk_diff.py \
+            rebuilt_apks/rebuilt.apk \
+            reference_apks/reference.apk \
+            diff_analysis_output
+
+      # -----------------------------------------------------------------
+      # Separate Granular Artifact Uploads (Human Readable & Reports)
+      # -----------------------------------------------------------------
+
+      - name: "Upload: 1. Reproducibility Summary & Analysis Report"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdroid-diff-summary-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: diff_analysis_output/summary/
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: "Upload: 2. Per-File Human-Readable Unified Diffs (*.diff)"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdroid-per-file-readable-diffs-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: diff_analysis_output/per_file_human_readable_diffs/
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: "Upload: 3. Decoded Human-Readable Files (Rebuilt APK)"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdroid-decoded-rebuilt-files-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: diff_analysis_output/decoded_rebuilt_files/
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: "Upload: 4. Decoded Human-Readable Files (Reference APK)"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdroid-decoded-reference-files-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: diff_analysis_output/decoded_reference_files/
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: "Upload: 5. Interactive Diffoscope Reports (HTML & TXT)"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdroid-diffoscope-report-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: diff_analysis_output/diffoscope/
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: "Upload: 6. Build Logs & APK Binaries"
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdroid-binaries-and-logs-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: |
+            unsigned/
+            logs/
+            rebuilt_apks/
+            reference_apks/
+          retention-days: 60
+          if-no-files-found: warn
