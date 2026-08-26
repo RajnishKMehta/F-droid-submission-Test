@@ -25,9 +25,9 @@ Binaries:
   https://github.com/RajnishKMehta/ArchiveTune-build-test/releases/download/v%v/app-foss-mobile-universal-release.apk
 
 Builds:
-  - versionName: 14.1.0
-    versionCode: 140
-    commit: 7bb8cf8f1981105052fab5473d30a1c04e261139
+  - versionName: 14.1.1
+    versionCode: 141
+    commit: 321f8da2b27d780db685a54a756e0a29f1bdb8a1
     subdir: app
     submodules: true
     gradle:
