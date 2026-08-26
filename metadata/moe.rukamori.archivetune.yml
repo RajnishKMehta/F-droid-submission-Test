@@ -1,7 +1,7 @@
 AntiFeatures:
   NonFreeNet:
     en-US: Uses YouTube Music and other proprietary online services for music playback,
-      social features, and related functionality.
+      social features, and related functionality
 Categories:
   - Local Media Player
   - Multimedia
