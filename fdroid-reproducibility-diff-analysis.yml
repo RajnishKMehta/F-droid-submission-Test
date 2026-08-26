@@ -1,0 +1,242 @@
+name: F-Droid Reproducibility Diff Analysis
+
+# Yeh workflow purane "F-Droid Metadata Build Check" (fdroid-metadata-build-check.yml)
+# se BILKUL ALAG/independent hai -- na koi file share karta hai na koi
+# dependency. Dono ek saath, alag-alag, chal sakte hain.
+#
+# Extra kaam jo yeh workflow karta hai: agar built APK, upstream reference
+# APK se match nahi karti (--test verification fail), to yeh poora
+# human-readable diff-analysis banata hai -- kaunsi files alag hain,
+# kaise alag hain (dex ka smali-diff, resources ka XML-diff, opaque
+# binaries ka hex-diff), aur ek summary report -- sab kuchh alag artifacts
+# me upload karta hai.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'metadata/*.yml'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Manually build ek specific appid:versionCode (khaali chhodo to PR-diff se auto-detect hoga)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1) PR me kaunse (appid, versionCode) naye/badle hain, wo dhundo
+  # ---------------------------------------------------------------------
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.find.outputs.targets }}
+      has_targets: ${{ steps.find.outputs.has_targets }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install --quiet pyyaml
+
+      - id: find
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MANUAL_TARGET: ${{ github.event.inputs.target }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${MANUAL_TARGET:-}" ]; then
+            APPID="${MANUAL_TARGET%%:*}"
+            VC="${MANUAL_TARGET##*:}"
+            TARGETS_JSON="[{\"appid\":\"$APPID\",\"versionCode\":$VC,\"target\":\"$MANUAL_TARGET\"}]"
+          else
+            git fetch origin "$BASE_SHA" "$HEAD_SHA" --depth=1 || true
+            TARGETS_JSON="$(python3 .github/scripts/find_reproducibility_diff_targets.py)"
+          fi
+
+          echo "Detected targets: $TARGETS_JSON"
+          echo "targets=$TARGETS_JSON" >> "$GITHUB_OUTPUT"
+
+          if [ "$TARGETS_JSON" = "[]" ]; then
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------
+  # 2) Build karo, phir reference se compare karke full diff-analysis banao
+  # ---------------------------------------------------------------------
+  build-and-analyze:
+    needs: detect
+    if: needs.detect.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+
+      - name: fdroidserver clone karo
+        run: git clone --depth=1 https://gitlab.com/fdroid/fdroidserver.git "${{ runner.temp }}/fdroidserver"
+
+      - name: Container ke liye read/write allow karo
+        run: |
+          chmod -R o+rwX "${{ github.workspace }}"
+          chmod -R o+rwX "${{ runner.temp }}/fdroidserver"
+
+      - name: F-Droid buildserver-trixie image pull karo
+        run: docker pull registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie
+
+      - name: "Build: ${{ matrix.target }}"
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          docker run --rm \
+            -u vagrant \
+            -e BUILD_TARGET \
+            -v "${{ github.workspace }}:/build" \
+            -v "${{ runner.temp }}/fdroidserver:/home/vagrant/fdroidserver" \
+            -w /build \
+            --entrypoint /bin/bash \
+            registry.gitlab.com/fdroid/fdroidserver:buildserver-trixie \
+            /build/.github/scripts/run_fdroid_build_for_diff.sh
+
+      # fdroidserver failed build ko tmp/ me rakhta hai, successful ko
+      # unsigned/ me. Reference (upstream Binaries: se downloaded) apk
+      # hamesha tmp/binaries/ me hoti hai (--test flag ke through).
+      - name: Built APK aur reference APK dhundo
+        id: locate
+        run: |
+          set -euo pipefail
+          APPID="${{ matrix.appid }}"
+          VC="${{ matrix.versionCode }}"
+
+          BUILT=""
+          if [ -f "tmp/${APPID}_${VC}.apk" ]; then
+            BUILT="tmp/${APPID}_${VC}.apk"
+          elif [ -f "unsigned/${APPID}_${VC}.apk" ]; then
+            BUILT="unsigned/${APPID}_${VC}.apk"
+          fi
+
+          REFERENCE=""
+          if [ -f "tmp/binaries/${APPID}_${VC}.binary.apk" ]; then
+            REFERENCE="tmp/binaries/${APPID}_${VC}.binary.apk"
+          fi
+
+          echo "built_apk=$BUILT" >> "$GITHUB_OUTPUT"
+          echo "reference_apk=$REFERENCE" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$BUILT" ]; then
+            echo "::warning::Built APK nahi mili ($APPID:$VC) -- diff analysis skip hoga"
+          fi
+          if [ -z "$REFERENCE" ]; then
+            echo "::warning::Reference (upstream) APK nahi mili -- is app me Binaries: nahi hai ya --test verification tak nahi pahuncha. Diff analysis skip hoga."
+          fi
+
+      - name: apktool install karo (human-readable decompile ke liye)
+        if: steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+        run: |
+          set -e
+          if ! command -v java &>/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y default-jre-headless
+          fi
+          if ! (sudo apt-get update -qq && sudo apt-get install -y apktool); then
+            echo "apt se apktool nahi mila -- GitHub releases se manual install kar rahe hain"
+            APKTOOL_VERSION="2.9.3"
+            sudo curl -sL "https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool" -o /usr/local/bin/apktool
+            sudo curl -sL "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -o /usr/local/bin/apktool.jar
+            sudo chmod +x /usr/local/bin/apktool
+          fi
+          apktool --version
+
+      - uses: actions/setup-python@v5
+        if: steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+        with:
+          python-version: '3.11'
+
+      - name: Diff analysis chalao (human-readable + summary bante hain)
+        if: steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+        run: |
+          python3 .github/scripts/analyze_apk_differences.py \
+            "${{ steps.locate.outputs.built_apk }}" \
+            "${{ steps.locate.outputs.reference_apk }}" \
+            "analysis-output"
+
+      # ---- Standard build artifacts (purane workflow jaisa hi) ----
+
+      - name: "Upload: pura build (60 din)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdroid-diff-full-build-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: |
+            build/
+            unsigned/
+            logs/
+            tmp/
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: "Upload: APK (alag)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdroid-diff-apk-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: |
+            unsigned/*.apk
+            tmp/*.apk
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: "Upload: build logs (alag)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdroid-diff-logs-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: logs/
+          retention-days: 60
+          if-no-files-found: warn
+
+      # ---- Naye diff-analysis artifacts ----
+
+      - name: "Upload: Difference analysis (summary + har file ka ALAG human-readable diff)"
+        if: always() && steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdroid-diff-analysis-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: |
+            analysis-output/summary.md
+            analysis-output/full_semantic_diff.txt
+            analysis-output/diffs/
+            analysis-output/apktool_built.log
+            analysis-output/apktool_reference.log
+          retention-days: 60
+          if-no-files-found: warn
+
+      - name: "Upload: Poore decompiled trees (maximum raw data)"
+        if: always() && steps.locate.outputs.built_apk != '' && steps.locate.outputs.reference_apk != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdroid-diff-decompiled-${{ matrix.appid }}-${{ matrix.versionCode }}
+          path: |
+            analysis-output/decompiled_built/
+            analysis-output/decompiled_reference/
+            analysis-output/raw_built/
+            analysis-output/raw_reference/
+          retention-days: 60
+          if-no-files-found: warn
