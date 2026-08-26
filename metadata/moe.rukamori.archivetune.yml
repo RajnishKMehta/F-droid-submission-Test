@@ -27,7 +27,7 @@ Binaries:
 Builds:
   - versionName: 14.1.1
     versionCode: 141
-    commit: 321f8da2b27d780db685a54a756e0a29f1bdb8a1
+    commit: 1bcc01862013bf8da8e600601c8e9d475347427a
     subdir: app
     submodules: true
     gradle:
