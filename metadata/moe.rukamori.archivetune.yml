@@ -4,8 +4,8 @@ AntiFeatures:
       social features, and related functionality.
 Categories:
   - Local Media Player
-  - Multimedia
   - Online Media Player
+    - Multimedia
 License: GPL-3.0-only
 AuthorName: rukamori
 AuthorEmail: me@koiiverse.cloud
