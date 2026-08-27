@@ -1,0 +1,972 @@
+name: Analyze APK Smali Differences
+
+on:
+  workflow_dispatch:
+    inputs:
+      differences_zip_url:
+        description: "Direct download URL of apk-differences.zip"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Disassemble and compare Smali
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ============================================================
+      # Java 21
+      # ============================================================
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # ============================================================
+      # Download baksmali
+      # ============================================================
+
+      - name: Download baksmali 3.0.10
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="3.0.10"
+
+          URL="https://github.com/baksmali/smali/releases/download/${VERSION}/baksmali-${VERSION}-fat-release.jar"
+
+          echo "Downloading baksmali:"
+          echo "$URL"
+
+          curl -fL \
+            --retry 5 \
+            --retry-delay 2 \
+            --connect-timeout 30 \
+            "$URL" \
+            -o baksmali.jar
+
+          test -s baksmali.jar
+
+          echo
+          java -jar baksmali.jar --version
+
+      # ============================================================
+      # Download previous apk-differences.zip
+      # ============================================================
+
+      - name: Download APK differences ZIP
+        env:
+          ZIP_URL: ${{ inputs.differences_zip_url }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p input
+
+          echo "Downloading APK differences ZIP..."
+
+          if [[ "$ZIP_URL" =~ ^https://github\.com/[^/]+/[^/]+/actions/runs/[0-9]+/artifacts/[0-9]+/?$ ]]; then
+            echo "GitHub Actions artifact URL detected."
+
+            REPO=$(echo "$ZIP_URL" | sed -E 's#^https://github\.com/([^/]+/[^/]+)/actions/runs/[0-9]+/artifacts/[0-9]+/?$#\1#')
+            ARTIFACT_ID=$(echo "$ZIP_URL" | sed -E 's#^.*/actions/runs/[0-9]+/artifacts/([0-9]+)/?$#\1#')
+
+            API_URL="https://api.github.com/repos/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip"
+
+            echo "Repository: $REPO"
+            echo "Artifact ID: $ARTIFACT_ID"
+
+            curl -fL \
+              --retry 5 \
+              --retry-delay 2 \
+              --connect-timeout 30 \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "$API_URL" \
+              -o input/apk-differences.zip
+
+          else
+            echo "Direct ZIP URL detected."
+
+            curl -fL \
+              --retry 5 \
+              --retry-delay 2 \
+              --connect-timeout 30 \
+              "$ZIP_URL" \
+              -o input/apk-differences.zip
+          fi
+
+          test -s input/apk-differences.zip
+
+          echo
+          echo "Downloaded:"
+          ls -lh input/apk-differences.zip
+
+      # ============================================================
+      # Extract
+      # ============================================================
+
+      - name: Extract APK differences
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p extracted
+
+          unzip -q \
+            input/apk-differences.zip \
+            -d extracted
+
+          test -d extracted/apk1
+          test -d extracted/apk2
+
+          echo "APK1:"
+          find extracted/apk1 -type f | sort
+
+          echo
+          echo "APK2:"
+          find extracted/apk2 -type f | sort
+
+      # ============================================================
+      # Prepare only DEX files
+      # ============================================================
+
+      - name: Prepare DEX
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dex/apk1
+          mkdir -p dex/apk2
+
+          for dex in classes.dex classes2.dex classes3.dex; do
+
+            if [ -f "extracted/apk1/$dex" ]; then
+              cp \
+                "extracted/apk1/$dex" \
+                "dex/apk1/$dex"
+            fi
+
+            if [ -f "extracted/apk2/$dex" ]; then
+              cp \
+                "extracted/apk2/$dex" \
+                "dex/apk2/$dex"
+            fi
+
+          done
+
+          echo
+          echo "DEX files:"
+          find dex -type f -exec ls -lh {} \;
+
+      # ============================================================
+      # Disassemble APK1
+      # ============================================================
+
+      - name: Disassemble APK1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p smali/apk1
+
+          for dex in classes.dex classes2.dex classes3.dex; do
+
+            if [ ! -f "dex/apk1/$dex" ]; then
+              continue
+            fi
+
+            case "$dex" in
+              classes.dex)
+                output="smali/apk1/classes"
+                ;;
+
+              classes2.dex)
+                output="smali/apk1/classes2"
+                ;;
+
+              classes3.dex)
+                output="smali/apk1/classes3"
+                ;;
+            esac
+
+            echo
+            echo "APK1 → $dex"
+
+            java \
+              -Xmx4g \
+              -jar baksmali.jar \
+              disassemble \
+              "dex/apk1/$dex" \
+              --output "$output"
+
+          done
+
+      # ============================================================
+      # Disassemble APK2
+      # ============================================================
+
+      - name: Disassemble APK2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p smali/apk2
+
+          for dex in classes.dex classes2.dex classes3.dex; do
+
+            if [ ! -f "dex/apk2/$dex" ]; then
+              continue
+            fi
+
+            case "$dex" in
+              classes.dex)
+                output="smali/apk2/classes"
+                ;;
+
+              classes2.dex)
+                output="smali/apk2/classes2"
+                ;;
+
+              classes3.dex)
+                output="smali/apk2/classes3"
+                ;;
+            esac
+
+            echo
+            echo "APK2 → $dex"
+
+            java \
+              -Xmx4g \
+              -jar baksmali.jar \
+              disassemble \
+              "dex/apk2/$dex" \
+              --output "$output"
+
+          done
+
+      # ============================================================
+      # Create normalized copies
+      #
+      # ONLY R8 map-id is normalized.
+      #
+      # Example:
+      #
+      # .source "r8-map-id-abcdef..."
+      #
+      # becomes:
+      #
+      # .source "r8-map-id-IGNORED"
+      #
+      # Nothing else is modified.
+      # ============================================================
+
+      - name: Normalize R8 map IDs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import re
+          import shutil
+
+          SOURCES = {
+              "apk1": "smali/apk1",
+              "apk2": "smali/apk2",
+          }
+
+          OUTPUTS = {
+              "apk1": "normalized/apk1",
+              "apk2": "normalized/apk2",
+          }
+
+          # Match the complete R8 map-id source line.
+          #
+          # Example:
+          # .source "r8-map-id-abcdef123..."
+          #
+          R8_PATTERN = re.compile(
+              r'^(\s*\.source\s+)"r8-map-id-[^"]*"\s*$'
+          )
+
+          for apk in SOURCES:
+
+              source_root = SOURCES[apk]
+              output_root = OUTPUTS[apk]
+
+              os.makedirs(
+                  output_root,
+                  exist_ok=True
+              )
+
+              for current, _, files in os.walk(source_root):
+
+                  for filename in files:
+
+                      source = os.path.join(
+                          current,
+                          filename
+                      )
+
+                      relative = os.path.relpath(
+                          source,
+                          source_root
+                      )
+
+                      destination = os.path.join(
+                          output_root,
+                          relative
+                      )
+
+                      os.makedirs(
+                          os.path.dirname(destination),
+                          exist_ok=True
+                      )
+
+                      # Only normalize .smali files.
+                      if not filename.endswith(".smali"):
+
+                          shutil.copy2(
+                              source,
+                              destination
+                          )
+
+                          continue
+
+                      with open(
+                          source,
+                          "r",
+                          encoding="utf-8",
+                          errors="surrogateescape"
+                      ) as f:
+                          lines = f.readlines()
+
+                      changed = False
+                      output = []
+
+                      for line in lines:
+
+                          if R8_PATTERN.match(
+                              line.rstrip("\r\n")
+                          ):
+
+                              newline = (
+                                  "\r\n"
+                                  if line.endswith("\r\n")
+                                  else "\n"
+                              )
+
+                              output.append(
+                                  '.source "r8-map-id-IGNORED"'
+                                  + newline
+                              )
+
+                              changed = True
+
+                          else:
+                              output.append(line)
+
+                      with open(
+                          destination,
+                          "w",
+                          encoding="utf-8",
+                          errors="surrogateescape"
+                      ) as f:
+                          f.writelines(output)
+
+          print("R8 map IDs normalized.")
+          PY
+
+      # ============================================================
+      # Install current diffoscope 329
+      #
+      # Debian sid currently provides version 329.
+      # ============================================================
+
+      - name: Pull Debian sid
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker pull debian:sid-slim
+
+      - name: Verify diffoscope 329
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run \
+            --rm \
+            debian:sid-slim \
+            bash -c '
+              set -e
+
+              apt-get update -qq
+
+              apt-get install \
+                -y \
+                --no-install-recommends \
+                diffoscope=329 \
+                diffoscope-minimal=329 \
+                >/dev/null
+
+              diffoscope --version
+            '
+
+      # ============================================================
+      # Find actual changed Smali files AFTER R8 normalization
+      #
+      # This is the important filter.
+      # ============================================================
+
+      - name: Find real Smali differences
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p differences/apk1
+          mkdir -p differences/apk2
+          mkdir -p reports
+
+          python3 <<'PY'
+          import hashlib
+          import os
+          import shutil
+
+          ROOT1 = "normalized/apk1"
+          ROOT2 = "normalized/apk2"
+
+          OUT1 = "differences/apk1"
+          OUT2 = "differences/apk2"
+
+          def collect(root):
+              result = {}
+
+              for current, _, files in os.walk(root):
+
+                  for filename in files:
+
+                      # ONLY Smali.
+                      if not filename.endswith(".smali"):
+                          continue
+
+                      path = os.path.join(
+                          current,
+                          filename
+                      )
+
+                      relative = os.path.relpath(
+                          path,
+                          root
+                      )
+
+                      result[relative] = path
+
+              return result
+
+          def sha256(path):
+              h = hashlib.sha256()
+
+              with open(path, "rb") as f:
+
+                  while True:
+
+                      chunk = f.read(1024 * 1024)
+
+                      if not chunk:
+                          break
+
+                      h.update(chunk)
+
+              return h.hexdigest()
+
+          apk1 = collect(ROOT1)
+          apk2 = collect(ROOT2)
+
+          changed = []
+          identical = []
+          only_apk1 = []
+          only_apk2 = []
+
+          for relative in sorted(
+              set(apk1) | set(apk2)
+          ):
+
+              left = apk1.get(relative)
+              right = apk2.get(relative)
+
+              if left is None:
+
+                  only_apk2.append(relative)
+
+                  destination = os.path.join(
+                      OUT2,
+                      relative
+                  )
+
+                  os.makedirs(
+                      os.path.dirname(destination),
+                      exist_ok=True
+                  )
+
+                  shutil.copy2(
+                      right,
+                      destination
+                  )
+
+                  continue
+
+              if right is None:
+
+                  only_apk1.append(relative)
+
+                  destination = os.path.join(
+                      OUT1,
+                      relative
+                  )
+
+                  os.makedirs(
+                      os.path.dirname(destination),
+                      exist_ok=True
+                  )
+
+                  shutil.copy2(
+                      left,
+                      destination
+                  )
+
+                  continue
+
+              hash1 = sha256(left)
+              hash2 = sha256(right)
+
+              if hash1 == hash2:
+
+                  identical.append(relative)
+
+                  continue
+
+              changed.append({
+                  "path": relative,
+                  "apk1_hash": hash1,
+                  "apk2_hash": hash2,
+                  "apk1_size": os.path.getsize(left),
+                  "apk2_size": os.path.getsize(right),
+              })
+
+              destination1 = os.path.join(
+                  OUT1,
+                  relative
+              )
+
+              destination2 = os.path.join(
+                  OUT2,
+                  relative
+              )
+
+              os.makedirs(
+                  os.path.dirname(destination1),
+                  exist_ok=True
+              )
+
+              os.makedirs(
+                  os.path.dirname(destination2),
+                  exist_ok=True
+              )
+
+              shutil.copy2(
+                  left,
+                  destination1
+              )
+
+              shutil.copy2(
+                  right,
+                  destination2
+              )
+
+          with open(
+              "differences/SMALI-DIFFERENCES.txt",
+              "w",
+              encoding="utf-8"
+          ) as f:
+
+              f.write("REAL SMALI DIFFERENCES\n")
+              f.write("=======================\n\n")
+
+              f.write(
+                  f"APK1 Smali files: {len(apk1)}\n"
+              )
+
+              f.write(
+                  f"APK2 Smali files: {len(apk2)}\n"
+              )
+
+              f.write(
+                  f"Identical after R8 normalization: "
+                  f"{len(identical)}\n"
+              )
+
+              f.write(
+                  f"Real changed files: {len(changed)}\n"
+              )
+
+              f.write(
+                  f"Only in APK1: {len(only_apk1)}\n"
+              )
+
+              f.write(
+                  f"Only in APK2: {len(only_apk2)}\n"
+              )
+
+              f.write("\n")
+
+              f.write("REAL CHANGED FILES\n")
+              f.write("==================\n\n")
+
+              for item in changed:
+
+                  f.write(
+                      f"{item['path']}\n"
+                  )
+
+                  f.write(
+                      f"  APK1 SHA256: "
+                      f"{item['apk1_hash']}\n"
+                  )
+
+                  f.write(
+                      f"  APK2 SHA256: "
+                      f"{item['apk2_hash']}\n"
+                  )
+
+                  f.write(
+                      f"  APK1 size: "
+                      f"{item['apk1_size']} bytes\n"
+                  )
+
+                  f.write(
+                      f"  APK2 size: "
+                      f"{item['apk2_size']} bytes\n\n"
+                  )
+
+              f.write("\n")
+              f.write("ONLY IN APK1\n")
+              f.write("=============\n\n")
+
+              for path in only_apk1:
+                  f.write(path + "\n")
+
+              f.write("\n")
+              f.write("ONLY IN APK2\n")
+              f.write("=============\n\n")
+
+              for path in only_apk2:
+                  f.write(path + "\n")
+
+          print()
+          print("========================================")
+          print("REAL SMALI COMPARISON")
+          print("========================================")
+          print(f"APK1 Smali : {len(apk1)}")
+          print(f"APK2 Smali : {len(apk2)}")
+          print(f"Identical  : {len(identical)}")
+          print(f"Changed    : {len(changed)}")
+          print(f"Only APK1 : {len(only_apk1)}")
+          print(f"Only APK2 : {len(only_apk2)}")
+          print("========================================")
+
+          print()
+          print("REAL CHANGED FILES:")
+
+          for item in changed:
+              print(
+                  "  " + item["path"]
+              )
+          PY
+
+      # ============================================================
+      # Run diffoscope ONLY on real changed Smali files
+      #
+      # R8-only files are already gone at this point.
+      # ============================================================
+
+      - name: Run diffoscope on real Smali differences
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import subprocess
+
+          LEFT_ROOT = "normalized/apk1"
+          RIGHT_ROOT = "normalized/apk2"
+
+          REPORT_ROOT = "reports"
+
+          os.makedirs(
+              REPORT_ROOT,
+              exist_ok=True
+          )
+
+          changed_file = (
+              "differences/SMALI-DIFFERENCES.txt"
+          )
+
+          changed = []
+
+          with open(
+              changed_file,
+              "r",
+              encoding="utf-8"
+          ) as f:
+
+              inside = False
+
+              for line in f:
+
+                  line = line.rstrip("\n")
+
+                  if line == "REAL CHANGED FILES":
+                      inside = True
+                      continue
+
+                  if not inside:
+                      continue
+
+                  if not line:
+                      continue
+
+                  if line.startswith("="):
+                      continue
+
+                  if line.startswith("ONLY IN"):
+                      break
+
+                  if (
+                      line.startswith("  APK1 SHA256:")
+                      or line.startswith("  APK2 SHA256:")
+                      or line.startswith("  APK1 size:")
+                      or line.startswith("  APK2 size:")
+                  ):
+                      continue
+
+                  if line.startswith("  "):
+                      continue
+
+                  changed.append(line)
+
+          print(
+              f"Running diffoscope on {len(changed)} "
+              f"real changed Smali files."
+          )
+
+          for index, relative in enumerate(
+              changed,
+              start=1
+          ):
+
+              left = os.path.join(
+                  LEFT_ROOT,
+                  relative
+              )
+
+              right = os.path.join(
+                  RIGHT_ROOT,
+                  relative
+              )
+
+              report = os.path.join(
+                  REPORT_ROOT,
+                  f"{index:05d}.txt"
+              )
+
+              os.makedirs(
+                  os.path.dirname(report),
+                  exist_ok=True
+              )
+
+              print()
+              print(
+                  f"[{index}/{len(changed)}] "
+                  f"{relative}"
+              )
+
+              command = [
+                  "docker",
+                  "run",
+                  "--rm",
+                  "-w",
+                  "/work",
+                  "-v",
+                  f"{os.getcwd()}:/work:ro",
+                  "debian:sid-slim",
+                  "bash",
+                  "-c",
+                  """
+                  set -e
+
+                  apt-get update -qq
+
+                  apt-get install \
+                    -y \
+                    --no-install-recommends \
+                    diffoscope=329 \
+                    diffoscope-minimal=329 \
+                    >/dev/null
+
+                  diffoscope \
+                    --text - \
+                    --max-text-report-size 1048576 \
+                    --max-diff-block-lines-saved 2000 \
+                    --exclude-directory-metadata=no \
+                    "$1" \
+                    "$2"
+                  """,
+                  "bash",
+                  f"/work/{left}",
+                  f"/work/{right}",
+              ]
+
+              with open(
+                  report,
+                  "w",
+                  encoding="utf-8"
+              ) as output:
+
+                  result = subprocess.run(
+                      command,
+                      stdout=output,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                  )
+
+              # diffoscope:
+              #
+              # 0 = identical
+              # 1 = differences
+              # 2 = error
+              #
+              # These files were already identified as different,
+              # so 1 is expected.
+
+              if result.returncode == 2:
+
+                  raise SystemExit(
+                      f"diffoscope failed for {relative}"
+                  )
+
+              # Keep a mapping from report number to file.
+              with open(
+                  f"{report}.name",
+                  "w",
+                  encoding="utf-8"
+              ) as f:
+                  f.write(relative)
+
+          print()
+          print(
+              f"Generated {len(changed)} diffoscope reports."
+          )
+          PY
+
+      # ============================================================
+      # Create compact report
+      #
+      # NEVER put giant diffoscope output into GITHUB_STEP_SUMMARY.
+      # GitHub limits the summary to 1 MiB.
+      # ============================================================
+
+      - name: Create compact summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# Smali comparison"
+            echo
+
+            echo "## Result"
+            echo
+            echo '```text'
+            cat differences/SMALI-DIFFERENCES.txt
+            echo '```'
+            echo
+
+            echo "## Diffoscope"
+            echo
+            echo "Diffoscope reports were generated only for real Smali differences."
+            echo
+            echo "The complete reports are available in the artifact."
+            echo
+
+            echo "## Ignored"
+            echo
+            echo "- R8 map ID differences"
+            echo "- Non-Smali files"
+            echo "- Raw DEX differences"
+            echo "- baseline.prof"
+            echo "- META-INF signing files"
+
+          } > differences/FINAL-REPORT.md
+
+          # Only compact information goes into GitHub summary.
+          {
+            echo "# Smali comparison"
+            echo
+            echo '```text'
+            cat differences/SMALI-DIFFERENCES.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ============================================================
+      # Artifact 1
+      #
+      # Complete APK1 Smali
+      # ============================================================
+
+      - name: Upload APK1 Smali
+        uses: actions/upload-artifact@v7
+        with:
+          name: apk1-smali
+          path: smali/apk1/
+          if-no-files-found: error
+          retention-days: 7
+
+      # ============================================================
+      # Artifact 2
+      #
+      # Complete APK2 Smali
+      # ============================================================
+
+      - name: Upload APK2 Smali
+        uses: actions/upload-artifact@v7
+        with:
+          name: apk2-smali
+          path: smali/apk2/
+          if-no-files-found: error
+          retention-days: 7
+
+      # ============================================================
+      # Artifact 3
+      #
+      # ONLY real differences
+      # ============================================================
+
+      - name: Upload real differences only
+        uses: actions/upload-artifact@v7
+        with:
+          name: smali-real-differences
+          path: |
+            differences/
+            reports/
+          if-no-files-found: error
+          retention-days: 14
