@@ -1,0 +1,388 @@
+name: Compare Release APKs
+
+on:
+  workflow_dispatch:
+    inputs:
+      developer_apk_url:
+        description: "Direct download URL of the developer release APK (signed)"
+        required: true
+        type: string
+      fdroid_apk_url:
+        description: "Direct download URL of the F-Droid/GitLab release APK"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Compare APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            unzip \
+            zipinfo \
+            diffoscope \
+            apksigner \
+            jq
+
+      - name: Download APKs
+        env:
+          DEVELOPER_APK_URL: ${{ inputs.developer_apk_url }}
+          FDROID_APK_URL: ${{ inputs.fdroid_apk_url }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p input
+
+          curl -fL --retry 5 --retry-delay 2 \
+            "$DEVELOPER_APK_URL" \
+            -o input/developer.apk
+
+          curl -fL --retry 5 --retry-delay 2 \
+            "$FDROID_APK_URL" \
+            -o input/fdroid.apk
+
+          test -s input/developer.apk
+          test -s input/fdroid.apk
+
+          ls -lh input/*.apk
+
+      - name: Verify APK signatures
+        run: |
+          set +e
+
+          echo "===== Developer APK ====="
+          apksigner verify --verbose --print-certs input/developer.apk
+          DEV_STATUS=$?
+
+          echo
+          echo "===== F-Droid APK ====="
+          apksigner verify --verbose --print-certs input/fdroid.apk
+          F_STATUS=$?
+
+          echo
+          echo "Developer verification exit: $DEV_STATUS"
+          echo "F-Droid verification exit: $F_STATUS"
+
+          # Signature verification is diagnostic only.
+          # The comparison below is also useful when one APK is signed
+          # and the other is unsigned.
+
+      - name: Record raw APK hashes
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# Raw APK SHA-256"
+            echo
+            echo '```text'
+            sha256sum input/developer.apk
+            sha256sum input/fdroid.apk
+            echo '```'
+          } > reports-raw.md
+
+          cat reports-raw.md
+
+      - name: Compare ZIP contents and metadata
+        run: |
+          set -euo pipefail
+
+          mkdir -p extracted/developer
+          mkdir -p extracted/fdroid
+          mkdir -p reports
+
+          unzip -q input/developer.apk -d extracted/developer
+          unzip -q input/fdroid.apk -d extracted/fdroid
+
+          echo "===== Developer APK entries =====" \
+            > reports/zipinfo-developer.txt
+          zipinfo -v input/developer.apk \
+            >> reports/zipinfo-developer.txt
+
+          echo "===== F-Droid APK entries =====" \
+            > reports/zipinfo-fdroid.txt
+          zipinfo -v input/fdroid.apk \
+            >> reports/zipinfo-fdroid.txt
+
+          find extracted/developer -type f -print \
+            | sed 's#^extracted/developer/##' \
+            | sort \
+            > reports/files-developer.txt
+
+          find extracted/fdroid -type f -print \
+            | sed 's#^extracted/fdroid/##' \
+            | sort \
+            > reports/files-fdroid.txt
+
+          diff -u \
+            reports/files-developer.txt \
+            reports/files-fdroid.txt \
+            > reports/file-list.diff || true
+
+      - name: Compare every APK entry by SHA-256
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import hashlib
+          import os
+
+          roots = {
+              "developer": "extracted/developer",
+              "fdroid": "extracted/fdroid",
+          }
+
+          def collect(root):
+              result = {}
+
+              for current, _, files in os.walk(root):
+                  for name in files:
+                      path = os.path.join(current, name)
+                      rel = os.path.relpath(path, root)
+                      result[rel] = path
+
+              return result
+
+          def sha256(path):
+              h = hashlib.sha256()
+
+              with open(path, "rb") as f:
+                  while True:
+                      chunk = f.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      h.update(chunk)
+
+              return h.hexdigest()
+
+          dev = collect(roots["developer"])
+          fd = collect(roots["fdroid"])
+
+          common = sorted(set(dev) & set(fd))
+          only_dev = sorted(set(dev) - set(fd))
+          only_fd = sorted(set(fd) - set(dev))
+
+          same = []
+          changed = []
+
+          for rel in common:
+              a = sha256(dev[rel])
+              b = sha256(fd[rel])
+
+              if a == b:
+                  same.append(rel)
+              else:
+                  changed.append((rel, a, b))
+
+          with open("reports/entry-hashes.txt", "w") as out:
+              out.write("APK ENTRY HASH COMPARISON\n")
+              out.write("=========================\n\n")
+              out.write(f"Developer entries: {len(dev)}\n")
+              out.write(f"F-Droid entries: {len(fd)}\n")
+              out.write(f"Common entries: {len(common)}\n")
+              out.write(f"Identical entries: {len(same)}\n")
+              out.write(f"Changed entries: {len(changed)}\n")
+              out.write(f"Only developer: {len(only_dev)}\n")
+              out.write(f"Only F-Droid: {len(only_fd)}\n\n")
+
+              out.write("CHANGED ENTRIES\n")
+              out.write("===============\n\n")
+
+              for rel, a, b in changed:
+                  out.write(f"{rel}\n")
+                  out.write(f"  developer: {a}\n")
+                  out.write(f"  fdroid:    {b}\n\n")
+
+              out.write("ONLY IN DEVELOPER\n")
+              out.write("=================\n\n")
+
+              for rel in only_dev:
+                  out.write(rel + "\n")
+
+              out.write("\nONLY IN F-DROID\n")
+              out.write("===============\n\n")
+
+              for rel in only_fd:
+                  out.write(rel + "\n")
+
+          print(open("reports/entry-hashes.txt").read())
+          PY
+
+      - name: Compare important DEX files
+        run: |
+          set -euo pipefail
+
+          {
+            echo "DEX SHA-256 COMPARISON"
+            echo "====================="
+            echo
+
+            for dex in classes.dex classes2.dex classes3.dex classes4.dex classes5.dex; do
+              A="extracted/developer/$dex"
+              B="extracted/fdroid/$dex"
+
+              if [ -f "$A" ] && [ -f "$B" ]; then
+                echo "$dex"
+                echo "  developer: $(sha256sum "$A" | cut -d' ' -f1)"
+                echo "  fdroid:    $(sha256sum "$B" | cut -d' ' -f1)"
+                echo
+              elif [ -f "$A" ]; then
+                echo "$dex"
+                echo "  developer: present"
+                echo "  fdroid:    MISSING"
+                echo
+              elif [ -f "$B" ]; then
+                echo "$dex"
+                echo "  developer: MISSING"
+                echo "  fdroid:    present"
+                echo
+              fi
+            done
+          } | tee reports/dex-hashes.txt
+
+      - name: Compare APK with diffoscope
+        run: |
+          set +e
+
+          # Keep the complete report as an artifact.
+          # Do NOT put it into GITHUB_STEP_SUMMARY because GitHub
+          # limits the job summary size.
+
+          diffoscope \
+            --text-color=never \
+            --max-text-report-size=0 \
+            input/developer.apk \
+            input/fdroid.apk \
+            > reports/diffoscope.txt \
+            2>&1
+
+          STATUS=$?
+
+          echo "diffoscope exit code: $STATUS"
+
+          # 0 = identical
+          # 1 = differences found
+          # 2+ = error
+          if [ "$STATUS" -ge 2 ]; then
+            exit "$STATUS"
+          fi
+
+      - name: Compare ZIP metadata separately
+        run: |
+          set -euo pipefail
+
+          # Extract the most useful metadata lines from zipinfo.
+          # This is diagnostic; the full files remain in the artifact.
+
+          {
+            echo "ZIP METADATA DIFF"
+            echo "================"
+            echo
+
+            diff -u \
+              reports/zipinfo-developer.txt \
+              reports/zipinfo-fdroid.txt \
+              || true
+          } > reports/zip-metadata.diff
+
+          cat reports/zip-metadata.diff
+
+      - name: Create compact summary
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          entry = Path("reports/entry-hashes.txt").read_text(
+              encoding="utf-8"
+          )
+
+          dex = Path("reports/dex-hashes.txt").read_text(
+              encoding="utf-8"
+          )
+
+          raw = Path("reports-raw.md").read_text(
+              encoding="utf-8"
+          )
+
+          # Extract only the small statistics section.
+          lines = entry.splitlines()
+          stats = []
+
+          for line in lines:
+              if line.startswith((
+                  "Developer entries:",
+                  "F-Droid entries:",
+                  "Common entries:",
+                  "Identical entries:",
+                  "Changed entries:",
+                  "Only developer:",
+                  "Only F-Droid:",
+              )):
+                  stats.append(line)
+
+          summary = [
+              "# APK Comparison",
+              "",
+              "## Entry comparison",
+              "",
+              "```text",
+              *stats,
+              "```",
+              "",
+              "## Raw APK SHA-256",
+              "",
+              "```text",
+              *raw.split("```text")[1].split("```")[0].strip().splitlines(),
+              "```",
+              "",
+              "## DEX hashes",
+              "",
+              "```text",
+              *dex.splitlines(),
+              "```",
+              "",
+              "Full `diffoscope`, ZIP metadata, entry hashes and "
+              "extracted APK contents are available in the artifact.",
+          ]
+
+          Path("reports/SUMMARY.md").write_text(
+              "\n".join(summary) + "\n",
+              encoding="utf-8"
+          )
+
+          # Keep GITHUB_STEP_SUMMARY deliberately small.
+          Path("reports/GITHUB-SUMMARY.md").write_text(
+              "\n".join(summary) + "\n",
+              encoding="utf-8"
+          )
+          PY
+
+          cat reports/GITHUB-SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload comparison report
+        uses: actions/upload-artifact@v7
+        with:
+          name: apk-comparison-report
+          path: |
+            reports/
+            reports-raw.md
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload extracted APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: apk-extracted-contents
+          path: |
+            extracted/developer/
+            extracted/fdroid/
+          if-no-files-found: error
+          retention-days: 7
