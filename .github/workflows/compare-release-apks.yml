@@ -20,39 +20,92 @@ jobs:
     name: Compare APKs
     runs-on: ubuntu-latest
 
+    env:
+      ANDROID_BUILD_TOOLS: "37.0.0"
+      ANDROID_PLATFORM: "37.0"
+
     steps:
       - name: Install base tools
         run: |
           set -euxo pipefail
+
           sudo apt-get update
-          sudo apt-get install -y unzip python3 python3-pip python3-venv
+          sudo apt-get install -y \
+            unzip \
+            python3 \
+            python3-pip \
+            python3-venv
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4.0.1
+        with:
+          # Do not let setup-android install its default "tools platform-tools"
+          # set. We install the exact SDK packages below ourselves.
+          packages: ""
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
-      - name: Install Android SDK 37 and Build Tools
+      - name: Accept Android SDK licenses
         shell: bash
         run: |
           set -euxo pipefail
 
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-37" \
-            "build-tools;36.0.0"
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Install Android SDK 37
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
 
-          test -d "$SDK_ROOT/platforms/android-37"
-          test -x "$SDK_ROOT/build-tools/36.0.0/apksigner"
-          test -x "$SDK_ROOT/build-tools/36.0.0/zipalign"
+          # Android 17 / API 37 is currently published as the preview/minor
+          # platform package `platforms;android-37.0`, not `platforms;android-37`.
+          #
+          # The corresponding current Build Tools package is 37.0.0.
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_PLATFORM}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
 
-          echo "$SDK_ROOT/build-tools/36.0.0" >> "$GITHUB_PATH"
+          test -d "$SDK_ROOT/platforms/android-${ANDROID_PLATFORM}"
+          test -x "$SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          test -x "$SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/zipalign"
 
-          "$SDK_ROOT/build-tools/36.0.0/apksigner" version
+          echo "$SDK_ROOT/platforms/android-${ANDROID_PLATFORM}" \
+            >> "$GITHUB_PATH"
 
-          # Do not use `zipalign -h`: zipalign has no -h option.
-          "$SDK_ROOT/build-tools/36.0.0/zipalign" 2>&1 \
-            | head -n 3
+          echo "$SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}" \
+            >> "$GITHUB_PATH"
+
+          echo "Installed SDK packages:"
+          sdkmanager --list_installed \
+            | grep -E \
+              "platform-tools|platforms;android-37|build-tools;37" \
+            || true
+
+      - name: Verify Android tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Android SDK:"
+          sdkmanager --version
+
+          echo
+          echo "apksigner:"
+          apksigner version
+
+          echo
+          echo "zipalign:"
+          zipalign 2>&1 | head -n 8 || true
+
+          echo
+          echo "Android platform:"
+          test -f \
+            "$ANDROID_SDK_ROOT/platforms/android-${ANDROID_PLATFORM}/android.jar"
+
+          echo "android-${ANDROID_PLATFORM} is installed."
 
       - name: Install APK reproducibility tools
         shell: bash
@@ -60,15 +113,15 @@ jobs:
           set -euxo pipefail
 
           python3 -m venv "$RUNNER_TEMP/apk-tools"
-          TOOL_BIN="$RUNNER_TEMP/apk-tools/bin"
 
-          "$TOOL_BIN/pip" install --upgrade pip
+          "$RUNNER_TEMP/apk-tools/bin/pip" install \
+            --upgrade pip
 
-          "$TOOL_BIN/pip" install \
+          "$RUNNER_TEMP/apk-tools/bin/pip" install \
             "apksigcopier==1.1.1" \
             "repro-apk==0.3.0"
 
-          echo "$TOOL_BIN" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/apk-tools/bin" >> "$GITHUB_PATH"
 
           apksigcopier --version
           repro-apk --version || true
@@ -83,12 +136,16 @@ jobs:
 
           mkdir -p input reports
 
-          curl -fL --retry 6 --retry-delay 2 \
+          curl -fL \
+            --retry 6 \
+            --retry-delay 2 \
             --connect-timeout 30 \
             "$DEVELOPER_APK_URL" \
             -o input/developer.apk
 
-          curl -fL --retry 6 --retry-delay 2 \
+          curl -fL \
+            --retry 6 \
+            --retry-delay 2 \
             --connect-timeout 30 \
             "$FDROID_APK_URL" \
             -o input/fdroid.apk
@@ -114,6 +171,12 @@ jobs:
             echo "Python:"
             python3 --version
             echo
+            echo "Android SDK manager:"
+            sdkmanager --version
+            echo
+            echo "Android platform: $ANDROID_PLATFORM"
+            echo "Android Build Tools: $ANDROID_BUILD_TOOLS"
+            echo
             echo "apksigcopier:"
             apksigcopier --version || true
             echo
@@ -123,8 +186,13 @@ jobs:
             echo "apksigner:"
             apksigner version
             echo
-            echo "Build Tools:"
-            echo "$ANDROID_SDK_ROOT/build-tools/36.0.0/source.properties"
+            echo "Build Tools source.properties:"
+            cat \
+              "$ANDROID_SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/source.properties"
+            echo
+            echo "Platform source.properties:"
+            cat \
+              "$ANDROID_SDK_ROOT/platforms/android-${ANDROID_PLATFORM}/source.properties"
           } | tee reports/tool-versions.txt
 
       - name: Verify APK signatures
@@ -134,16 +202,22 @@ jobs:
 
           {
             echo "===== DEVELOPER APK ====="
-            apksigner verify --verbose --print-certs input/developer.apk
+            apksigner verify \
+              --verbose \
+              --print-certs \
+              input/developer.apk
             echo "exit=$?"
 
             echo
             echo "===== F-DROID APK ====="
-            apksigner verify --verbose --print-certs input/fdroid.apk
+            apksigner verify \
+              --verbose \
+              --print-certs \
+              input/fdroid.apk
             echo "exit=$?"
           } | tee reports/signature-verification.txt
 
-      - name: Compare APK signatures and signed/unsigned content
+      - name: Compare signatures with apksigcopier
         shell: bash
         run: |
           set +e
@@ -177,7 +251,9 @@ jobs:
             > reports/zip-metadata.diff \
             2>&1
 
-          echo "repro-apk exit=$?"
+          STATUS=$?
+
+          echo "repro-apk exit=$STATUS"
           cat reports/zip-metadata.diff || true
 
           exit 0
@@ -187,10 +263,17 @@ jobs:
         run: |
           set -euxo pipefail
 
-          mkdir -p extracted/developer extracted/fdroid
+          mkdir -p \
+            extracted/developer \
+            extracted/fdroid
 
-          unzip -q input/developer.apk -d extracted/developer
-          unzip -q input/fdroid.apk -d extracted/fdroid
+          unzip -q \
+            input/developer.apk \
+            -d extracted/developer
+
+          unzip -q \
+            input/fdroid.apk \
+            -d extracted/fdroid
 
       - name: Compare every extracted entry by SHA-256
         shell: bash
@@ -215,9 +298,11 @@ jobs:
 
           def sha256(path):
               h = hashlib.sha256()
+
               with path.open("rb") as f:
                   while chunk := f.read(1024 * 1024):
                       h.update(chunk)
+
               return h.hexdigest()
 
           dev = collect(roots["developer"])
@@ -239,7 +324,11 @@ jobs:
               else:
                   changed.append((name, a, b))
 
-          with open("reports/entry-content-hashes.txt", "w") as out:
+          with open(
+              "reports/entry-content-hashes.txt",
+              "w",
+              encoding="utf-8",
+          ) as out:
               out.write("APK ENTRY CONTENT COMPARISON\n")
               out.write("============================\n\n")
               out.write(f"Developer entries: {len(dev)}\n")
@@ -260,14 +349,20 @@ jobs:
 
               out.write("ONLY IN DEVELOPER\n")
               out.write("=================\n\n")
-              out.writelines(f"{x}\n" for x in only_dev)
+
+              for name in only_dev:
+                  out.write(f"{name}\n")
 
               out.write("\nONLY IN F-DROID\n")
               out.write("===============\n\n")
-              out.writelines(f"{x}\n" for x in only_fd)
 
-          cat = Path("reports/entry-content-hashes.txt")
-          print(cat.read_text())
+              for name in only_fd:
+                  out.write(f"{name}\n")
+
+          print(
+              Path("reports/entry-content-hashes.txt")
+              .read_text(encoding="utf-8")
+          )
           PY
 
       - name: Compare DEX directly
@@ -289,9 +384,11 @@ jobs:
 
           def sha256(path):
               h = hashlib.sha256()
+
               with path.open("rb") as f:
                   while chunk := f.read(1024 * 1024):
                       h.update(chunk)
+
               return h.hexdigest()
 
           with open("reports/dex-hashes.txt", "w") as out:
@@ -302,12 +399,16 @@ jobs:
                   out.write(f"{name}\n")
 
                   if a.exists():
-                      out.write(f"  developer: {sha256(a)}\n")
+                      out.write(
+                          f"  developer: {sha256(a)}\n"
+                      )
                   else:
                       out.write("  developer: MISSING\n")
 
                   if b.exists():
-                      out.write(f"  fdroid:    {sha256(b)}\n")
+                      out.write(
+                          f"  fdroid:    {sha256(b)}\n"
+                      )
                   else:
                       out.write("  fdroid:    MISSING\n")
 
@@ -341,7 +442,7 @@ jobs:
             > reports/unzip-list.diff \
             || true
 
-      - name: Run diffoscope 329
+      - name: Run current diffoscope
         shell: bash
         run: |
           set -euo pipefail
@@ -367,8 +468,9 @@ jobs:
 
           echo "diffoscope exit=$STATUS"
 
-          # 0 = identical, 1 = differences.
-          # >=2 means diffoscope itself failed.
+          # 0 = identical
+          # 1 = differences found
+          # >=2 = diffoscope execution/error
           if [ "$STATUS" -ge 2 ]; then
             exit "$STATUS"
           fi
@@ -383,11 +485,11 @@ jobs:
 
           entry = Path(
               "reports/entry-content-hashes.txt"
-          ).read_text()
+          ).read_text(encoding="utf-8")
 
           dex = Path(
               "reports/dex-hashes.txt"
-          ).read_text()
+          ).read_text(encoding="utf-8")
 
           stats = [
               x for x in entry.splitlines()
@@ -427,7 +529,10 @@ jobs:
 
           Path(
               "reports/SUMMARY.md"
-          ).write_text("\n".join(summary) + "\n")
+          ).write_text(
+              "\n".join(summary) + "\n",
+              encoding="utf-8",
+          )
 
           print("\n".join(summary))
           PY
