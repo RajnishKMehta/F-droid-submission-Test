@@ -1,4 +1,4 @@
-name: Compare Release Zip APKs
+name: Compare Release APKs
 
 on:
   workflow_dispatch:
@@ -447,38 +447,63 @@ jobs:
             > reports/unzip-list.diff \
             || true
 
-      - name: Run current diffoscope
+      - name: Run diffoscope
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
-          docker pull \
-            registry.salsa.debian.org/reproducible-builds/diffoscope:latest
+          IMAGE="registry.salsa.debian.org/reproducible-builds/diffoscope:latest"
+
+          docker pull "$IMAGE"
+
+          # diffoscope exit status:
+          #   0 = no differences
+          #   1 = differences found
+          #   2+ = diffoscope could not complete / runtime error
+          #
+          # This is a diagnostic step, so differences must NOT fail the job.
 
           set +e
 
           docker run --rm \
-            -v "$PWD:/work:ro" \
-            -w /work \
-            registry.salsa.debian.org/reproducible-builds/diffoscope:latest \
+            -v "$PWD/input:/work/input:ro" \
+            -v "$PWD/reports:/work/reports" \
+            "$IMAGE" \
             diffoscope \
               --text-color=never \
               --max-text-report-size=0 \
-              input/developer.apk \
-              input/fdroid.apk \
+              /work/input/developer.apk \
+              /work/input/fdroid.apk \
             > reports/diffoscope.txt \
             2>&1
 
           STATUS=$?
 
-          echo "diffoscope exit=$STATUS"
+          {
+            echo "diffoscope exit code: $STATUS"
+            echo
+            echo "0 = no differences"
+            echo "1 = differences found"
+            echo "2+ = diffoscope could not complete the comparison"
+          } | tee reports/diffoscope-status.txt
 
-          # 0 = identical
-          # 1 = differences found
-          # >=2 = diffoscope execution/error
-          if [ "$STATUS" -ge 2 ]; then
-            exit "$STATUS"
-          fi
+          # Keep the report even if diffoscope itself returns an error.
+          # The rest of the diagnostic workflow must continue.
+          exit 0
+
+      - name: Validate diagnostic reports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f reports/diffoscope.txt
+          test -f reports/diffoscope-status.txt
+
+          echo "diffoscope report:"
+          wc -c reports/diffoscope.txt
+
+          echo
+          cat reports/diffoscope-status.txt
 
       - name: Create compact GitHub summary
         shell: bash
