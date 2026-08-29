@@ -4,12 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       developer_apk_url:
-        description: "Direct download URL of the developer release APK"
+        description: "Direct URL of the developer release APK"
         required: true
         type: string
-
       fdroid_apk_url:
-        description: "Direct download URL of the F-Droid/GitLab release APK"
+        description: "Direct URL of the F-Droid/GitLab release APK"
         required: true
         type: string
 
@@ -23,74 +22,56 @@ jobs:
 
     steps:
       - name: Install base tools
-        shell: bash
         run: |
           set -euxo pipefail
-
           sudo apt-get update
-
-          sudo apt-get install -y \
-            curl \
-            unzip \
-            python3 \
-            python3-pip \
-            python3-venv \
-            docker.io
+          sudo apt-get install -y unzip python3 python3-pip python3-venv
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK Platform 37
+      - name: Install Android SDK 37 and Build Tools
         shell: bash
         run: |
           set -euxo pipefail
 
-          sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" \
+          sdkmanager --install \
             "platform-tools" \
             "platforms;android-37" \
             "build-tools;36.0.0"
 
-          SDK_ROOT="${ANDROID_SDK_ROOT}"
-
-          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-          echo "$SDK_ROOT/build-tools/36.0.0" >> "$GITHUB_PATH"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
 
           test -d "$SDK_ROOT/platforms/android-37"
           test -x "$SDK_ROOT/build-tools/36.0.0/apksigner"
           test -x "$SDK_ROOT/build-tools/36.0.0/zipalign"
 
-          echo "Android SDK:"
-          sdkmanager --version
+          echo "$SDK_ROOT/build-tools/36.0.0" >> "$GITHUB_PATH"
 
-          echo
-          echo "Android SDK Platform:"
-          ls -ld "$SDK_ROOT/platforms/android-37"
-
-          echo
-          echo "Build Tools:"
           "$SDK_ROOT/build-tools/36.0.0/apksigner" version
 
-          echo
-          echo "zipalign:"
+          # Do not use `zipalign -h`: zipalign has no -h option.
           "$SDK_ROOT/build-tools/36.0.0/zipalign" 2>&1 \
-            | sed -n '1,12p' || true
+            | head -n 3
 
-      - name: Install APK analysis tools
+      - name: Install APK reproducibility tools
         shell: bash
         run: |
           set -euxo pipefail
 
           python3 -m venv "$RUNNER_TEMP/apk-tools"
+          TOOL_BIN="$RUNNER_TEMP/apk-tools/bin"
 
-          "$RUNNER_TEMP/apk-tools/bin/python" -m pip install \
-            --upgrade pip
+          "$TOOL_BIN/pip" install --upgrade pip
 
-          "$RUNNER_TEMP/apk-tools/bin/pip" install \
-            "apksigcopier==1.1.1"
+          "$TOOL_BIN/pip" install \
+            "apksigcopier==1.1.1" \
+            "repro-apk==0.3.0"
 
-          echo "$RUNNER_TEMP/apk-tools/bin" >> "$GITHUB_PATH"
+          echo "$TOOL_BIN" >> "$GITHUB_PATH"
 
           apksigcopier --version
+          repro-apk --version || true
 
       - name: Download APKs
         env:
@@ -102,47 +83,49 @@ jobs:
 
           mkdir -p input reports
 
-          curl \
-            --fail \
-            --location \
-            --retry 6 \
-            --retry-delay 2 \
+          curl -fL --retry 6 --retry-delay 2 \
             --connect-timeout 30 \
             "$DEVELOPER_APK_URL" \
-            --output input/developer.apk
+            -o input/developer.apk
 
-          curl \
-            --fail \
-            --location \
-            --retry 6 \
-            --retry-delay 2 \
+          curl -fL --retry 6 --retry-delay 2 \
             --connect-timeout 30 \
             "$FDROID_APK_URL" \
-            --output input/fdroid.apk
+            -o input/fdroid.apk
 
           test -s input/developer.apk
           test -s input/fdroid.apk
 
-          file input/developer.apk
-          file input/fdroid.apk
-
+          file input/developer.apk input/fdroid.apk
           ls -lh input/*.apk
 
-      - name: Record APK hashes
+      - name: Record tool versions
         shell: bash
         run: |
           set -euo pipefail
 
           {
-            echo "# Raw APK SHA-256"
+            echo "APK COMPARISON TOOLCHAIN"
+            echo "========================"
             echo
-            echo '```text'
-            sha256sum input/developer.apk
-            sha256sum input/fdroid.apk
-            echo '```'
-          } > reports/raw-apk-hashes.md
-
-          cat reports/raw-apk-hashes.md
+            echo "Runner:"
+            uname -a
+            echo
+            echo "Python:"
+            python3 --version
+            echo
+            echo "apksigcopier:"
+            apksigcopier --version || true
+            echo
+            echo "repro-apk:"
+            repro-apk --version || true
+            echo
+            echo "apksigner:"
+            apksigner version
+            echo
+            echo "Build Tools:"
+            echo "$ANDROID_SDK_ROOT/build-tools/36.0.0/source.properties"
+          } | tee reports/tool-versions.txt
 
       - name: Verify APK signatures
         shell: bash
@@ -151,41 +134,65 @@ jobs:
 
           {
             echo "===== DEVELOPER APK ====="
-            apksigner verify \
-              --verbose \
-              --print-certs \
-              input/developer.apk
+            apksigner verify --verbose --print-certs input/developer.apk
+            echo "exit=$?"
 
             echo
             echo "===== F-DROID APK ====="
-            apksigner verify \
-              --verbose \
-              --print-certs \
+            apksigner verify --verbose --print-certs input/fdroid.apk
+            echo "exit=$?"
+          } | tee reports/signature-verification.txt
+
+      - name: Compare APK signatures and signed/unsigned content
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== apksigcopier compare ====="
+            apksigcopier compare \
+              input/developer.apk \
               input/fdroid.apk
-          } 2>&1 | tee reports/signature-verification.txt
+            echo "normal compare exit=$?"
 
-          # Signature status is diagnostic only.
-          # A signed developer APK and an unsigned F-Droid APK are valid
-          # inputs for the subsequent APK-content comparison.
+            echo
+            echo "===== apksigcopier compare --unsigned ====="
+            apksigcopier compare \
+              --unsigned \
+              input/developer.apk \
+              input/fdroid.apk
+            echo "unsigned compare exit=$?"
+          } 2>&1 | tee reports/apksigcopier-compare.txt
 
-      - name: Extract APKs
+          exit 0
+
+      - name: Compare APK ZIP metadata
+        shell: bash
+        run: |
+          set +e
+
+          repro-apk diff-zip-meta \
+            input/developer.apk \
+            input/fdroid.apk \
+            > reports/zip-metadata.diff \
+            2>&1
+
+          echo "repro-apk exit=$?"
+          cat reports/zip-metadata.diff || true
+
+          exit 0
+
+      - name: Extract APK contents
         shell: bash
         run: |
           set -euxo pipefail
 
-          mkdir -p \
-            extracted/developer \
-            extracted/fdroid
+          mkdir -p extracted/developer extracted/fdroid
 
-          unzip -q \
-            input/developer.apk \
-            -d extracted/developer
+          unzip -q input/developer.apk -d extracted/developer
+          unzip -q input/fdroid.apk -d extracted/fdroid
 
-          unzip -q \
-            input/fdroid.apk \
-            -d extracted/fdroid
-
-      - name: Compare APK entry contents
+      - name: Compare every extracted entry by SHA-256
         shell: bash
         run: |
           set -euo pipefail
@@ -200,136 +207,70 @@ jobs:
           }
 
           def collect(root):
-              result = {}
-
-              for path in root.rglob("*"):
-                  if path.is_file():
-                      result[path.relative_to(root).as_posix()] = path
-
-              return result
+              return {
+                  p.relative_to(root).as_posix(): p
+                  for p in root.rglob("*")
+                  if p.is_file()
+              }
 
           def sha256(path):
               h = hashlib.sha256()
-
               with path.open("rb") as f:
-                  while True:
-                      chunk = f.read(1024 * 1024)
-
-                      if not chunk:
-                          break
-
+                  while chunk := f.read(1024 * 1024):
                       h.update(chunk)
-
               return h.hexdigest()
 
-          developer = collect(roots["developer"])
-          fdroid = collect(roots["fdroid"])
+          dev = collect(roots["developer"])
+          fd = collect(roots["fdroid"])
 
-          common = sorted(
-              set(developer) & set(fdroid)
-          )
+          common = sorted(set(dev) & set(fd))
+          only_dev = sorted(set(dev) - set(fd))
+          only_fd = sorted(set(fd) - set(dev))
 
-          only_developer = sorted(
-              set(developer) - set(fdroid)
-          )
-
-          only_fdroid = sorted(
-              set(fdroid) - set(developer)
-          )
-
-          identical = []
+          same = []
           changed = []
 
           for name in common:
-              left = sha256(developer[name])
-              right = sha256(fdroid[name])
+              a = sha256(dev[name])
+              b = sha256(fd[name])
 
-              if left == right:
-                  identical.append(name)
+              if a == b:
+                  same.append(name)
               else:
-                  changed.append(
-                      (name, left, right)
-                  )
+                  changed.append((name, a, b))
 
-          with open(
-              "reports/entry-content-hashes.txt",
-              "w",
-              encoding="utf-8"
-          ) as out:
+          with open("reports/entry-content-hashes.txt", "w") as out:
+              out.write("APK ENTRY CONTENT COMPARISON\n")
+              out.write("============================\n\n")
+              out.write(f"Developer entries: {len(dev)}\n")
+              out.write(f"F-Droid entries: {len(fd)}\n")
+              out.write(f"Common entries: {len(common)}\n")
+              out.write(f"Identical contents: {len(same)}\n")
+              out.write(f"Changed contents: {len(changed)}\n")
+              out.write(f"Only developer: {len(only_dev)}\n")
+              out.write(f"Only F-Droid: {len(only_fd)}\n\n")
 
-              out.write(
-                  "APK ENTRY CONTENT COMPARISON\n"
-              )
-              out.write(
-                  "============================\n\n"
-              )
+              out.write("CHANGED ENTRY CONTENTS\n")
+              out.write("=====================\n\n")
 
-              out.write(
-                  f"Developer entries: {len(developer)}\n"
-              )
-              out.write(
-                  f"F-Droid entries: {len(fdroid)}\n"
-              )
-              out.write(
-                  f"Common entries: {len(common)}\n"
-              )
-              out.write(
-                  f"Identical contents: {len(identical)}\n"
-              )
-              out.write(
-                  f"Changed contents: {len(changed)}\n"
-              )
-              out.write(
-                  f"Only developer: {len(only_developer)}\n"
-              )
-              out.write(
-                  f"Only F-Droid: {len(only_fdroid)}\n"
-              )
-
-              out.write(
-                  "\n\nCHANGED ENTRY CONTENTS\n"
-              )
-              out.write(
-                  "=====================\n\n"
-              )
-
-              for name, left, right in changed:
+              for name, a, b in changed:
                   out.write(f"{name}\n")
-                  out.write(
-                      f"  developer: {left}\n"
-                  )
-                  out.write(
-                      f"  fdroid:    {right}\n\n"
-                  )
+                  out.write(f"  developer: {a}\n")
+                  out.write(f"  fdroid:    {b}\n\n")
 
-              out.write(
-                  "ONLY IN DEVELOPER\n"
-              )
-              out.write(
-                  "=================\n\n"
-              )
+              out.write("ONLY IN DEVELOPER\n")
+              out.write("=================\n\n")
+              out.writelines(f"{x}\n" for x in only_dev)
 
-              for name in only_developer:
-                  out.write(name + "\n")
+              out.write("\nONLY IN F-DROID\n")
+              out.write("===============\n\n")
+              out.writelines(f"{x}\n" for x in only_fd)
 
-              out.write(
-                  "\nONLY IN F-DROID\n"
-              )
-              out.write(
-                  "===============\n\n"
-              )
-
-              for name in only_fdroid:
-                  out.write(name + "\n")
-
-          print(
-              Path(
-                  "reports/entry-content-hashes.txt"
-              ).read_text()
-          )
+          cat = Path("reports/entry-content-hashes.txt")
+          print(cat.read_text())
           PY
 
-      - name: Compare DEX hashes
+      - name: Compare DEX directly
         shell: bash
         run: |
           set -euo pipefail
@@ -338,93 +279,60 @@ jobs:
           import hashlib
           from pathlib import Path
 
-          developer = Path("extracted/developer")
-          fdroid = Path("extracted/fdroid")
+          dev = Path("extracted/developer")
+          fd = Path("extracted/fdroid")
 
           names = sorted(
-              {
-                  p.name
-                  for p in developer.glob("classes*.dex")
-              }
-              |
-              {
-                  p.name
-                  for p in fdroid.glob("classes*.dex")
-              }
+              {p.name for p in dev.glob("classes*.dex")}
+              | {p.name for p in fd.glob("classes*.dex")}
           )
 
           def sha256(path):
               h = hashlib.sha256()
-
               with path.open("rb") as f:
-                  while True:
-                      chunk = f.read(1024 * 1024)
-
-                      if not chunk:
-                          break
-
+                  while chunk := f.read(1024 * 1024):
                       h.update(chunk)
-
               return h.hexdigest()
 
-          with open(
-              "reports/dex-hashes.txt",
-              "w",
-              encoding="utf-8"
-          ) as out:
-
+          with open("reports/dex-hashes.txt", "w") as out:
               for name in names:
-                  left = developer / name
-                  right = fdroid / name
+                  a = dev / name
+                  b = fd / name
 
                   out.write(f"{name}\n")
 
-                  if left.exists():
-                      left_hash = sha256(left)
-                      out.write(
-                          f"  developer: {left_hash}\n"
-                      )
+                  if a.exists():
+                      out.write(f"  developer: {sha256(a)}\n")
                   else:
-                      out.write(
-                          "  developer: MISSING\n"
-                      )
+                      out.write("  developer: MISSING\n")
 
-                  if right.exists():
-                      right_hash = sha256(right)
-                      out.write(
-                          f"  fdroid:    {right_hash}\n"
-                      )
+                  if b.exists():
+                      out.write(f"  fdroid:    {sha256(b)}\n")
                   else:
-                      out.write(
-                          "  fdroid:    MISSING\n"
-                      )
+                      out.write("  fdroid:    MISSING\n")
 
-                  if left.exists() and right.exists():
-                      if left_hash == right_hash:
-                          out.write(
-                              "  result:    IDENTICAL\n"
-                          )
-                      else:
-                          out.write(
-                              "  result:    DIFFERENT\n"
-                          )
+                  if a.exists() and b.exists():
+                      result = (
+                          "IDENTICAL"
+                          if sha256(a) == sha256(b)
+                          else "DIFFERENT"
+                      )
+                      out.write(f"  result:    {result}\n")
 
                   out.write("\n")
 
           cat reports/dex-hashes.txt
           PY
 
-      - name: Compare ZIP structure
+      - name: Compare ZIP entry metadata
         shell: bash
         run: |
           set -euo pipefail
 
-          unzip -lv \
-            input/developer.apk \
+          unzip -lv input/developer.apk \
             > reports/unzip-list-developer.txt
 
-          unzip -lv \
-            input/fdroid.apk \
+          unzip -lv input/fdroid.apk \
             > reports/unzip-list-fdroid.txt
 
           diff -u \
@@ -433,55 +341,7 @@ jobs:
             > reports/unzip-list.diff \
             || true
 
-          zipinfo -v \
-            input/developer.apk \
-            > reports/zipinfo-developer.txt
-
-          zipinfo -v \
-            input/fdroid.apk \
-            > reports/zipinfo-fdroid.txt
-
-          diff -u \
-            reports/zipinfo-developer.txt \
-            reports/zipinfo-fdroid.txt \
-            > reports/zipinfo.diff \
-            || true
-
-      - name: Compare APK signatures with apksigcopier
-        shell: bash
-        run: |
-          set +e
-
-          {
-            echo "===== NORMAL COMPARISON ====="
-            apksigcopier compare \
-              input/developer.apk \
-              input/fdroid.apk
-
-            NORMAL_STATUS=$?
-
-            echo
-            echo "normal exit=$NORMAL_STATUS"
-
-            echo
-            echo "===== UNSIGNED COMPARISON ====="
-
-            apksigcopier compare \
-              --unsigned \
-              input/developer.apk \
-              input/fdroid.apk
-
-            UNSIGNED_STATUS=$?
-
-            echo
-            echo "unsigned exit=$UNSIGNED_STATUS"
-
-          } 2>&1 | tee reports/apksigcopier-compare.txt
-
-          # This step is diagnostic. Differences are expected for some
-          # signed/unsigned combinations and must not hide diffoscope output.
-
-      - name: Run modern diffoscope
+      - name: Run diffoscope 329
         shell: bash
         run: |
           set -euo pipefail
@@ -491,10 +351,9 @@ jobs:
 
           set +e
 
-          docker run \
-            --rm \
-            --volume "$PWD:/work:ro" \
-            --workdir /work \
+          docker run --rm \
+            -v "$PWD:/work:ro" \
+            -w /work \
             registry.salsa.debian.org/reproducible-builds/diffoscope:latest \
             diffoscope \
               --text-color=never \
@@ -508,16 +367,13 @@ jobs:
 
           echo "diffoscope exit=$STATUS"
 
-          # diffoscope:
-          # 0 = identical
-          # 1 = differences
-          # >=2 = tool/runtime error
-
+          # 0 = identical, 1 = differences.
+          # >=2 means diffoscope itself failed.
           if [ "$STATUS" -ge 2 ]; then
             exit "$STATUS"
           fi
 
-      - name: Generate compact summary
+      - name: Create compact GitHub summary
         shell: bash
         run: |
           set -euo pipefail
@@ -527,20 +383,15 @@ jobs:
 
           entry = Path(
               "reports/entry-content-hashes.txt"
-          ).read_text(
-              encoding="utf-8"
-          )
+          ).read_text()
 
           dex = Path(
               "reports/dex-hashes.txt"
-          ).read_text(
-              encoding="utf-8"
-          )
+          ).read_text()
 
-          stats = []
-
-          for line in entry.splitlines():
-              if line.startswith((
+          stats = [
+              x for x in entry.splitlines()
+              if x.startswith((
                   "Developer entries:",
                   "F-Droid entries:",
                   "Common entries:",
@@ -548,17 +399,16 @@ jobs:
                   "Changed contents:",
                   "Only developer:",
                   "Only F-Droid:",
-              )):
-                  stats.append(line)
+              ))
+          ]
 
           dex_results = [
-              line
-              for line in dex.splitlines()
-              if "result:" in line
+              x for x in dex.splitlines()
+              if "result:" in x
           ]
 
           summary = [
-              "# APK comparison",
+              "# APK Comparison",
               "",
               "## Entry contents",
               "",
@@ -572,32 +422,17 @@ jobs:
               *dex_results,
               "```",
               "",
-              "Full reports are available in the artifact:",
-              "",
-              "- `entry-content-hashes.txt`",
-              "- `dex-hashes.txt`",
-              "- `zipinfo.diff`",
-              "- `unzip-list.diff`",
-              "- `apksigcopier-compare.txt`",
-              "- `diffoscope.txt`",
+              "Full reports are in the uploaded artifact.",
           ]
 
           Path(
-              "reports/GITHUB-SUMMARY.md"
-          ).write_text(
-              "\n".join(summary) + "\n",
-              encoding="utf-8"
-          )
+              "reports/SUMMARY.md"
+          ).write_text("\n".join(summary) + "\n")
 
-          print(
-              Path(
-                  "reports/GITHUB-SUMMARY.md"
-              ).read_text()
-          )
+          print("\n".join(summary))
           PY
 
-          cat reports/GITHUB-SUMMARY.md \
-            >> "$GITHUB_STEP_SUMMARY"
+          cat reports/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload comparison report
         uses: actions/upload-artifact@v7
