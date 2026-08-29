@@ -21,14 +21,14 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      ANDROID_BUILD_TOOLS: "37.0.0"
       ANDROID_PLATFORM: "37.0"
+      ANDROID_BUILD_TOOLS: "37.0.0"
+      APK_TOOL_BIN: "${{ runner.temp }}/apk-tools/bin"
 
     steps:
       - name: Install base tools
         run: |
           set -euxo pipefail
-
           sudo apt-get update
           sudo apt-get install -y \
             unzip \
@@ -39,18 +39,9 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4.0.1
         with:
-          # Do not let setup-android install its default "tools platform-tools"
-          # set. We install the exact SDK packages below ourselves.
           packages: ""
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: false
-
-      - name: Accept Android SDK licenses
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          yes | sdkmanager --licenses >/dev/null || true
 
       - name: Install Android SDK 37
         shell: bash
@@ -59,37 +50,36 @@ jobs:
 
           SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
 
-          # Android 17 / API 37 is currently published as the preview/minor
-          # platform package `platforms;android-37.0`, not `platforms;android-37`.
-          #
-          # The corresponding current Build Tools package is 37.0.0.
+          yes | sdkmanager --licenses >/dev/null || true
+
           sdkmanager \
             "platform-tools" \
             "platforms;android-${ANDROID_PLATFORM}" \
             "build-tools;${ANDROID_BUILD_TOOLS}"
 
-          test -d "$SDK_ROOT/platforms/android-${ANDROID_PLATFORM}"
-          test -x "$SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
-          test -x "$SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/zipalign"
+          test -d \
+            "$SDK_ROOT/platforms/android-${ANDROID_PLATFORM}"
 
-          echo "$SDK_ROOT/platforms/android-${ANDROID_PLATFORM}" \
-            >> "$GITHUB_PATH"
+          test -x \
+            "$SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+
+          test -x \
+            "$SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/zipalign"
 
           echo "$SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}" \
             >> "$GITHUB_PATH"
-
-          echo "Installed SDK packages:"
-          sdkmanager --list_installed \
-            | grep -E \
-              "platform-tools|platforms;android-37|build-tools;37" \
-            || true
 
       - name: Verify Android tools
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Android SDK:"
+          echo "SDK root: ${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          echo "Platform: $ANDROID_PLATFORM"
+          echo "Build Tools: $ANDROID_BUILD_TOOLS"
+
+          echo
+          echo "sdkmanager:"
           sdkmanager --version
 
           echo
@@ -100,12 +90,8 @@ jobs:
           echo "zipalign:"
           zipalign 2>&1 | head -n 8 || true
 
-          echo
-          echo "Android platform:"
           test -f \
-            "$ANDROID_SDK_ROOT/platforms/android-${ANDROID_PLATFORM}/android.jar"
-
-          echo "android-${ANDROID_PLATFORM} is installed."
+            "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/platforms/android-${ANDROID_PLATFORM}/android.jar"
 
       - name: Install APK reproducibility tools
         shell: bash
@@ -114,17 +100,27 @@ jobs:
 
           python3 -m venv "$RUNNER_TEMP/apk-tools"
 
-          "$RUNNER_TEMP/apk-tools/bin/pip" install \
-            --upgrade pip
+          TOOL_BIN="$RUNNER_TEMP/apk-tools/bin"
 
-          "$RUNNER_TEMP/apk-tools/bin/pip" install \
+          # Do not rely on the venv bin directory being reloaded into PATH
+          # during this step. Invoke the installed executables explicitly.
+          "$TOOL_BIN/python" -m pip install --upgrade pip
+
+          "$TOOL_BIN/python" -m pip install \
             "apksigcopier==1.1.1" \
             "repro-apk==0.3.0"
 
-          echo "$RUNNER_TEMP/apk-tools/bin" >> "$GITHUB_PATH"
+          test -x "$TOOL_BIN/apksigcopier"
+          test -x "$TOOL_BIN/repro-apk"
 
-          apksigcopier --version
-          repro-apk --version || true
+          echo "$TOOL_BIN" >> "$GITHUB_PATH"
+
+          echo "apksigcopier:"
+          "$TOOL_BIN/apksigcopier" --version
+
+          echo
+          echo "repro-apk:"
+          "$TOOL_BIN/repro-apk" --version
 
       - name: Download APKs
         env:
@@ -161,6 +157,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          TOOL_BIN="$RUNNER_TEMP/apk-tools/bin"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+
           {
             echo "APK COMPARISON TOOLCHAIN"
             echo "========================"
@@ -178,21 +177,19 @@ jobs:
             echo "Android Build Tools: $ANDROID_BUILD_TOOLS"
             echo
             echo "apksigcopier:"
-            apksigcopier --version || true
+            "$TOOL_BIN/apksigcopier" --version
             echo
             echo "repro-apk:"
-            repro-apk --version || true
+            "$TOOL_BIN/repro-apk" --version
             echo
             echo "apksigner:"
-            apksigner version
+            "$SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/apksigner" version
             echo
             echo "Build Tools source.properties:"
-            cat \
-              "$ANDROID_SDK_ROOT/build-tools/${ANDROID_BUILD_TOOLS}/source.properties"
+            cat "$SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS/source.properties"
             echo
             echo "Platform source.properties:"
-            cat \
-              "$ANDROID_SDK_ROOT/platforms/android-${ANDROID_PLATFORM}/source.properties"
+            cat "$SDK_ROOT/platforms/android-$ANDROID_PLATFORM/source.properties"
           } | tee reports/tool-versions.txt
 
       - name: Verify APK signatures
@@ -222,22 +219,26 @@ jobs:
         run: |
           set +e
 
+          TOOL_BIN="$RUNNER_TEMP/apk-tools/bin"
+
           {
             echo "===== apksigcopier compare ====="
-            apksigcopier compare \
+            "$TOOL_BIN/apksigcopier" compare \
               input/developer.apk \
               input/fdroid.apk
             echo "normal compare exit=$?"
 
             echo
             echo "===== apksigcopier compare --unsigned ====="
-            apksigcopier compare \
+            "$TOOL_BIN/apksigcopier" compare \
               --unsigned \
               input/developer.apk \
               input/fdroid.apk
             echo "unsigned compare exit=$?"
           } 2>&1 | tee reports/apksigcopier-compare.txt
 
+          # Comparison differences are expected and must not stop
+          # the diagnostic workflow.
           exit 0
 
       - name: Compare APK ZIP metadata
@@ -245,7 +246,9 @@ jobs:
         run: |
           set +e
 
-          repro-apk diff-zip-meta \
+          TOOL_BIN="$RUNNER_TEMP/apk-tools/bin"
+
+          "$TOOL_BIN/repro-apk" diff-zip-meta \
             input/developer.apk \
             input/fdroid.apk \
             > reports/zip-metadata.diff \
@@ -300,7 +303,10 @@ jobs:
               h = hashlib.sha256()
 
               with path.open("rb") as f:
-                  while chunk := f.read(1024 * 1024):
+                  while True:
+                      chunk = f.read(1024 * 1024)
+                      if not chunk:
+                          break
                       h.update(chunk)
 
               return h.hexdigest()
@@ -386,7 +392,10 @@ jobs:
               h = hashlib.sha256()
 
               with path.open("rb") as f:
-                  while chunk := f.read(1024 * 1024):
+                  while True:
+                      chunk = f.read(1024 * 1024)
+                      if not chunk:
+                          break
                       h.update(chunk)
 
               return h.hexdigest()
@@ -399,16 +408,12 @@ jobs:
                   out.write(f"{name}\n")
 
                   if a.exists():
-                      out.write(
-                          f"  developer: {sha256(a)}\n"
-                      )
+                      out.write(f"  developer: {sha256(a)}\n")
                   else:
                       out.write("  developer: MISSING\n")
 
                   if b.exists():
-                      out.write(
-                          f"  fdroid:    {sha256(b)}\n"
-                      )
+                      out.write(f"  fdroid:    {sha256(b)}\n")
                   else:
                       out.write("  fdroid:    MISSING\n")
 
