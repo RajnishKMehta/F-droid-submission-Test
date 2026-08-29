@@ -1,4 +1,4 @@
-name: Compare Release zip APKs
+name: Compare Release Zip APKs
 
 on:
   workflow_dispatch:
@@ -426,8 +426,9 @@ jobs:
 
                   out.write("\n")
 
-          cat reports/dex-hashes.txt
           PY
+
+          cat reports/dex-hashes.txt
 
       - name: Compare ZIP entry metadata
         shell: bash
