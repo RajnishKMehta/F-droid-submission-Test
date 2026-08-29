@@ -1,4 +1,4 @@
-name: Compare Release APKs
+name: Compare Release zip APKs
 
 on:
   workflow_dispatch:
