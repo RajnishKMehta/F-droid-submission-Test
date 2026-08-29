@@ -23,7 +23,6 @@ jobs:
     env:
       ANDROID_PLATFORM: "37.0"
       ANDROID_BUILD_TOOLS: "37.0.0"
-      APK_TOOL_BIN: "${{ runner.temp }}/apk-tools/bin"
 
     steps:
       - name: Install base tools
