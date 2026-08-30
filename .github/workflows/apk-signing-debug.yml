@@ -1,0 +1,341 @@
+name: APK Signing Debug
+
+on:
+  workflow_dispatch:
+    inputs:
+      reference_apk_url:
+        description: "Reference/signed APK URL"
+        required: true
+        type: string
+
+      built_apk_url:
+        description: "Built APK URL (optional, preferably the F-Droid-built APK)"
+        required: false
+        type: string
+
+      build_tools_version:
+        description: "Android Build Tools version"
+        required: false
+        default: "37.0.0"
+        type: string
+
+jobs:
+  analyze:
+    name: Analyze APK signing
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v7
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android Build Tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "build-tools;${{ inputs.build_tools_version }}"
+
+      - name: Download APKs
+        env:
+          REFERENCE_URL: ${{ inputs.reference_apk_url }}
+          BUILT_URL: ${{ inputs.built_apk_url }}
+        run: |
+          mkdir -p apk-analysis
+
+          echo "Downloading reference APK..."
+          curl -L --fail --retry 3 \
+            "$REFERENCE_URL" \
+            -o apk-analysis/reference.apk
+
+          if [ -n "$BUILT_URL" ]; then
+            echo "Downloading built APK..."
+            curl -L --fail --retry 3 \
+              "$BUILT_URL" \
+              -o apk-analysis/built.apk
+          fi
+
+          ls -lh apk-analysis/
+
+      - name: Locate Android tools
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+
+          export BUILD_TOOLS="$ANDROID_HOME/build-tools/${{ inputs.build_tools_version }}"
+
+          echo "BUILD_TOOLS=$BUILD_TOOLS" >> "$GITHUB_ENV"
+
+          "$BUILD_TOOLS/apksigner" version
+          "$BUILD_TOOLS/zipalign" -h | head -20
+
+      - name: Basic APK information
+        run: |
+          set +e
+
+          for apk in apk-analysis/*.apk; do
+            echo
+            echo "============================================================"
+            echo "APK: $apk"
+            echo "============================================================"
+
+            echo
+            echo "### File information"
+            file "$apk"
+            stat "$apk"
+
+            echo
+            echo "### SHA-256"
+            sha256sum "$apk"
+
+            echo
+            echo "### SHA-1"
+            sha1sum "$apk"
+
+            echo
+            echo "### MD5"
+            md5sum "$apk"
+
+            echo
+            echo "### ZIP test"
+            unzip -t "$apk"
+
+            echo
+            echo "### ZIP entry count"
+            unzip -Z1 "$apk" | wc -l
+
+            echo
+            echo "### Important APK entries"
+            unzip -Z1 "$apk" | grep -E \
+              '(^|/)(AndroidManifest.xml|resources.arsc|classes[0-9]*\.dex|META-INF/|lib/|res/)' \
+              | head -200
+          done
+
+      - name: ZIP alignment check
+        run: |
+          set +e
+
+          for apk in apk-analysis/*.apk; do
+            echo
+            echo "============================================================"
+            echo "ZIPALIGN CHECK: $apk"
+            echo "============================================================"
+
+            "$BUILD_TOOLS/zipalign" -c -v 4 "$apk"
+
+            status=$?
+
+            echo
+            echo "zipalign exit code: $status"
+
+            if [ "$status" -eq 0 ]; then
+              echo "RESULT: ZIP ALIGNMENT OK"
+            else
+              echo "RESULT: ZIP ALIGNMENT FAILED"
+            fi
+          done
+
+      - name: APK signature verification
+        run: |
+          set +e
+
+          for apk in apk-analysis/*.apk; do
+            echo
+            echo "============================================================"
+            echo "APKSIGNER VERIFY: $apk"
+            echo "============================================================"
+
+            "$BUILD_TOOLS/apksigner" verify \
+              --verbose \
+              "$apk"
+
+            status=$?
+
+            echo
+            echo "apksigner exit code: $status"
+
+            if [ "$status" -eq 0 ]; then
+              echo "RESULT: SIGNATURE VERIFICATION PASSED"
+            else
+              echo "RESULT: SIGNATURE VERIFICATION FAILED"
+            fi
+          done
+
+      - name: APK signer certificate details
+        run: |
+          set +e
+
+          for apk in apk-analysis/*.apk; do
+            echo
+            echo "============================================================"
+            echo "CERTIFICATE DETAILS: $apk"
+            echo "============================================================"
+
+            "$BUILD_TOOLS/apksigner" verify \
+              --verbose \
+              --print-certs \
+              "$apk"
+
+            echo
+          done
+
+      - name: Extract APK signing-related files
+        run: |
+          set +e
+
+          mkdir -p apk-analysis/extracted
+
+          for apk in apk-analysis/*.apk; do
+            name="$(basename "$apk" .apk)"
+
+            echo
+            echo "============================================================"
+            echo "SIGNING FILES: $name"
+            echo "============================================================"
+
+            unzip -l "$apk" | grep -E \
+              'META-INF/|APK Sig Block|SIGNATURE|CERT.RSA|CERT.SF|MANIFEST.MF' \
+              || true
+
+            mkdir -p "apk-analysis/extracted/$name"
+
+            unzip -q "$apk" \
+              'META-INF/*' \
+              -d "apk-analysis/extracted/$name" \
+              2>/dev/null || true
+
+            find "apk-analysis/extracted/$name" -type f -print
+          done
+
+      - name: Compare APKs
+        if: ${{ inputs.built_apk_url != '' }}
+        run: |
+          set +e
+
+          echo
+          echo "============================================================"
+          echo "REFERENCE vs BUILT APK"
+          echo "============================================================"
+
+          echo
+          echo "### File sizes"
+
+          ls -lh apk-analysis/reference.apk
+          ls -lh apk-analysis/built.apk
+
+          echo
+          echo "### SHA-256"
+
+          sha256sum \
+            apk-analysis/reference.apk \
+            apk-analysis/built.apk
+
+          echo
+          echo "### Exact byte comparison"
+
+          if cmp -s \
+            apk-analysis/reference.apk \
+            apk-analysis/built.apk; then
+            echo "IDENTICAL: APK files are byte-for-byte identical"
+          else
+            echo "DIFFERENT: APK files are NOT byte-for-byte identical"
+            cmp -l \
+              apk-analysis/reference.apk \
+              apk-analysis/built.apk \
+              | head -100
+          fi
+
+          echo
+          echo "### ZIP entry comparison"
+
+          unzip -Z1 apk-analysis/reference.apk | sort \
+            > /tmp/reference-files.txt
+
+          unzip -Z1 apk-analysis/built.apk | sort \
+            > /tmp/built-files.txt
+
+          diff -u \
+            /tmp/reference-files.txt \
+            /tmp/built-files.txt \
+            || true
+
+          echo
+          echo "### Per-entry CRC/size comparison"
+
+          unzip -lv apk-analysis/reference.apk \
+            > /tmp/reference-zip.txt
+
+          unzip -lv apk-analysis/built.apk \
+            > /tmp/built-zip.txt
+
+          diff -u \
+            /tmp/reference-zip.txt \
+            /tmp/built-zip.txt \
+            || true
+
+      - name: Generate summary
+        if: always()
+        run: |
+          {
+            echo "# APK Signing Debug Report"
+            echo
+            echo "## Inputs"
+            echo
+            echo "- Reference APK: \`${{ inputs.reference_apk_url }}\`"
+            if [ -n "${{ inputs.built_apk_url }}" ]; then
+              echo "- Built APK: \`${{ inputs.built_apk_url }}\`"
+            else
+              echo "- Built APK: not provided"
+            fi
+
+            echo
+            echo "## Tool versions"
+            echo
+            "$BUILD_TOOLS/apksigner" version
+            echo
+            "$BUILD_TOOLS/zipalign" -h | head -1
+
+            echo
+            echo "## SHA-256"
+            echo
+            sha256sum apk-analysis/*.apk
+
+            echo
+            echo "## APK sizes"
+            echo
+            ls -lh apk-analysis/*.apk
+
+            echo
+            echo "## Signature verification"
+            echo
+            for apk in apk-analysis/*.apk; do
+              echo "### $(basename "$apk")"
+              "$BUILD_TOOLS/apksigner" verify \
+                --verbose \
+                --print-certs \
+                "$apk" 2>&1 || true
+              echo
+            done
+
+            echo
+            echo "## ZIP alignment"
+            echo
+            for apk in apk-analysis/*.apk; do
+              echo "### $(basename "$apk")"
+              "$BUILD_TOOLS/zipalign" -c -v 4 "$apk" 2>&1 || true
+              echo
+            done
+          } | tee apk-analysis/report.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload complete analysis
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: apk-signing-debug-report
+          path: apk-analysis/
+          retention-days: 7
