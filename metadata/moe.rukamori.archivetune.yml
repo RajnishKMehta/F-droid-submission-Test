@@ -23,7 +23,7 @@ RepoType: git
 Repo: https://github.com/RajnishKMehta/ArchiveTune-build-test.git
 Binaries: 
   https://github.com/RajnishKMehta/ArchiveTune-build-test/releases/download/v%v/app-foss-mobile-universal-release.apk
-  
+
 Builds:
   - versionName: 14.3.2
     versionCode: 145
@@ -31,12 +31,12 @@ Builds:
     subdir: app
     submodules: true
     gradle:
-     - fossMobileUniversal
+      - fossMobileUniversal
     srclibs:
-     - reproducible-apk-tools@v0.3.1
+      - reproducible-apk-tools@v0.3.1
     postbuild:
-     - $$reproducible-apk-tools$$/zipalign.py -P 16 --pad-like-apksigner --replace $$OUT$$ $$OUT$$-fixed.apk && mv $$OUT$$-fixed.apk $$OUT$$
-     
+      - $$reproducible-apk-tools$$/zipalign.py -P 16 --pad-like-apksigner --replace $$OUT$$ $$OUT$$-fixed.apk && mv $$OUT$$-fixed.apk $$OUT$$
+
 AllowedAPKSigningKeys: 2b0ca7f890305622f7a9ed57f07b11764d1ad2ba534599d802bb91008269b778
 
 AutoUpdateMode: Version
